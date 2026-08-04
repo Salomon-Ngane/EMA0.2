@@ -37,7 +37,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+# NOUVELLE LIGNE :
+BINANCE_KLINES_URL = "https://api1.binance.com/api/v3/klines"
+
 
 
 # =====================================================================
