@@ -56,7 +56,7 @@ LEN_SLOW = 55   # EMA55 (jaune)
 
 # Fenetre max (en bougies du timeframe signal) pour attendre un retest
 # apres une cassure
-RETEST_WINDOW = 20
+RETEST_WINDOW = 2
 
 # Fenetre glissante sur le 4H pour le plus haut / plus bas (TP/SL)
 LOOKBACK_4H = 5
@@ -330,6 +330,12 @@ def main():
         time.sleep(0.3)  # petite pause pour rester sous les limites Binance
     save_state(state)
 
+import requests, os
+
+# Test rapide d'envoi
+token = os.getenv("TELEGRAM_BOT_TOKEN")
+chat_id = os.getenv("TELEGRAM_CHAT_ID")
+requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": "🔔 Test réussi depuis GitHub Actions !"})
 
 if __name__ == "__main__":
     main()
