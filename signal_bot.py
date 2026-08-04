@@ -332,10 +332,19 @@ def main():
 
 import requests, os
 
-# Test rapide d'envoi
+import os
+import requests
+
+# Récupération automatique depuis les Secrets GitHub
 token = os.getenv("TELEGRAM_BOT_TOKEN")
 chat_id = os.getenv("TELEGRAM_CHAT_ID")
-requests.post(f"https://api.telegram.org/bot{token}/sendMessage", data={"chat_id": chat_id, "text": "🔔 Test réussi depuis GitHub Actions !"})
+
+# Test d'envoi forcé
+requests.post(
+    f"https://api.telegram.org/bot{token}/sendMessage",
+    data={"chat_id": chat_id, "text": "🔔 Test réussi depuis GitHub Actions !"},
+)
+
 
 if __name__ == "__main__":
     main()
