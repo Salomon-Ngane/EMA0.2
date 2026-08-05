@@ -1,23 +1,23 @@
 """
 Signal Bot - MA25/MA55 Cross Strategy (Cassure + Retest) -> Telegram
 =====================================================================
-Version optimisée avec notification de démarrage et réglages souples.
+Version optimisée 24/7 pour Render (Flask Health Check + Boucle continue)
 """
 
 import os
 import json
 import time
+import threading
 from datetime import datetime, timezone
 
 import requests
 import pandas as pd
+from flask import Flask
 
 # =====================================================================
 # CONFIGURATION - Ajustée pour recevoir des signaux réguliers
 # =====================================================================
 
-# Si la variable SYMBOLS est définie dans GitHub, on la découpe par virgule.
-# Sinon, on utilise la liste par défaut.
 DEFAULT_SYMBOLS = "BTCUSDT,BNBUSDT,SUIUSDT,ADAUSDT,XRPUSDT"
 ENV_SYMBOLS = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
 SYMBOLS = [s.strip().upper() for s in ENV_SYMBOLS.split(",") if s.strip()]
@@ -34,7 +34,7 @@ LOOKBACK_4H = 5
 
 USE_TREND_FILTER = True
 USE_RR_FILTER = True
-MIN_RR = 1.5   # NIVEAU AJUSTE (2.7 était trop strict)
+MIN_RR = 1.5   
 
 SIGNAL_SOURCE = "both"
 
@@ -42,9 +42,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
-# NOUVELLE LIGNE :
 BINANCE_KLINES_URL = "https://api1.binance.com/api/v3/klines"
-
 
 
 # =====================================================================
@@ -245,7 +243,6 @@ def process_symbol(symbol: str, state: dict) -> int:
         ("retest", "SHORT", "retest_short_signal"),
     ]
 
-    # Analyse des 2 dernières bougies clôturées pour ne rater aucun signal
     for idx in [-2, -1]:
         row = df_signal.iloc[idx]
         last_ts = row["close_time"].isoformat()
@@ -267,13 +264,7 @@ def process_symbol(symbol: str, state: dict) -> int:
 
 
 def main():
-    print("🚀 Démarrage du Signal Bot...")
-    
-    # Message d'accueil / test de santé Telegram
-    init_sent = send_telegram_message("🤖 <b>Signal Bot actif</b> — Analyse des paires en cours...")
-    if not init_sent:
-        print("[!] Impossible d'envoyer le message de test sur Telegram. Vérifiez votre TOKEN et CHAT_ID.")
-    
+    print("🔍 Analyse du marché en cours...")
     state = load_state()
     total_signals = 0
 
@@ -288,30 +279,9 @@ def main():
     print(f"✅ Analyse terminée. {total_signals} signal(aux) envoyé(s).")
 
 
-if __name__ == "__main__":
-    main()
-    import time
-
-def loop():
-    print("🤖 Bot démarré sur serveur 24/7...")
-    send_telegram_message("🚀 Bot d'analyse démarré en continu (24/7) !")
-    
-    while True:
-        try:
-            print("🔍 Lancement de l'analyse...")
-            main()  # Exécute votre fonction principale d'analyse
-        except Exception as e:
-            print(f"[!] Erreur durant l'exécution : {e}")
-        
-        # Attend 1 heure (3600 secondes) avant le prochain scan
-        # (Ajustez à 7200 pour 2 heures, ou 1800 pour 30 minutes)
-        print("💤 En attente du prochain intervalle (1h)...")
-        time.sleep(3600)
-
-if __name__ == "__main__":
-    loop()
-    import threading
-from flask import Flask
+# =====================================================================
+# CONFIGURATION SERVEUR RENDER & BOUCLE CONTINU 24/7
+# =====================================================================
 
 app = Flask(__name__)
 
@@ -320,10 +290,25 @@ def health_check():
     return "Bot is alive!", 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-# Lancer Flask dans un thread séparé avant votre boucle principale
-threading.Thread(target=run_flask, daemon=True).start()
+def main_loop():
+    print("🤖 Bot démarré sur serveur 24/7...")
+    send_telegram_message("🚀 Bot d'analyse démarré en continu sur Render (24/7) !")
+    
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print(f"[!] Erreur durant l'exécution : {e}")
+        
+        print("💤 En attente du prochain intervalle (1 heure)...")
+        time.sleep(3600)
 
-
+if __name__ == "__main__":
+    # Démarre le serveur web en arrière-plan
+    threading.Thread(target=run_flask, daemon=True).start()
+    # Démarre la boucle infinie d'analyse
+    main_loop()
 
