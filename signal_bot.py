@@ -290,4 +290,25 @@ def main():
 
 if __name__ == "__main__":
     main()
+    import time
+
+def loop():
+    print("🤖 Bot démarré sur serveur 24/7...")
+    send_telegram_message("🚀 Bot d'analyse démarré en continu (24/7) !")
+    
+    while True:
+        try:
+            print("🔍 Lancement de l'analyse...")
+            main()  # Exécute votre fonction principale d'analyse
+        except Exception as e:
+            print(f"[!] Erreur durant l'exécution : {e}")
+        
+        # Attend 1 heure (3600 secondes) avant le prochain scan
+        # (Ajustez à 7200 pour 2 heures, ou 1800 pour 30 minutes)
+        print("💤 En attente du prochain intervalle (1h)...")
+        time.sleep(3600)
+
+if __name__ == "__main__":
+    loop()
+
 
