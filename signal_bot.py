@@ -310,5 +310,20 @@ def loop():
 
 if __name__ == "__main__":
     loop()
+    import threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "Bot is alive!", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# Lancer Flask dans un thread séparé avant votre boucle principale
+threading.Thread(target=run_flask, daemon=True).start()
+
 
 
