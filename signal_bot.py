@@ -16,8 +16,13 @@ import pandas as pd
 # CONFIGURATION - Ajustée pour recevoir des signaux réguliers
 # =====================================================================
 
-SYMBOLS = ["BTCUSDT", "BNBUSDT", "SUIUSDT", "ADAUSDT", "XRPUSDT"]
-SIGNAL_TIMEFRAME = "30m"
+# Si la variable SYMBOLS est définie dans GitHub, on la découpe par virgule.
+# Sinon, on utilise la liste par défaut.
+DEFAULT_SYMBOLS = "BTCUSDT,BNBUSDT,SUIUSDT,ADAUSDT,XRPUSDT"
+ENV_SYMBOLS = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
+SYMBOLS = [s.strip().upper() for s in ENV_SYMBOLS.split(",") if s.strip()]
+
+SIGNAL_TIMEFRAME = "2h"
 HTF_TIMEFRAME = "4h"
 
 LEN_FAST = 10   # EMA verte
