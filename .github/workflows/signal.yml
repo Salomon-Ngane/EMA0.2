@@ -2,9 +2,10 @@ name: Signal Bot
 
 on:
   schedule:
-    # S'exécute toutes les 2 heures
     - cron: "0 */2 * * *"
   workflow_dispatch: {}
+  repository_dispatch:
+    types: [telegram_trigger]
 
 permissions:
   contents: write
