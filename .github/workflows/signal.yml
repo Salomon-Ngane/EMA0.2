@@ -2,11 +2,10 @@ name: Signal Bot
 
 on:
   schedule:
-    # Toutes les 30 minutes (ajuste selon SIGNAL_TIMEFRAME dans signal_bot.py)
-    - cron: "*/30 * * * *"
-  workflow_dispatch: {}   # permet de le lancer manuellement depuis l'onglet Actions
+    # S'exécute toutes les 2 heures
+    - cron: "0 */2 * * *"
+  workflow_dispatch: {}
 
-# Necessaire pour que le job puisse recommitter state.json
 permissions:
   contents: write
 
@@ -29,6 +28,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SYMBOLS: ${{ vars.SYMBOLS }}
         run: python signal_bot.py
 
       - name: Sauvegarder l'etat (anti-doublon) dans le repo
