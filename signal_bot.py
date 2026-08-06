@@ -1,7 +1,7 @@
 """
 Signal Bot - MA25/MA55 Cross Strategy (Cassure + Retest) -> Telegram
 =====================================================================
-Version optimisée 24/7 pour Render (Flask Health Check + Boucle continue)
+Version optimisée 24/7 pour Render (Flask + Webhook + Sauvegarde dynamique des symboles)
 """
 
 import os
@@ -16,12 +16,37 @@ import pandas as pd
 from flask import Flask, request
 
 # =====================================================================
-# CONFIGURATION - Ajustée pour recevoir des signaux réguliers
+# CONFIGURATION & PERSISTANCE DES SYMBOLES
 # =====================================================================
 
-DEFAULT_SYMBOLS = "BTCUSDT,BNBUSDT,SUIUSDT,ADAUSDT,XRPUSDT"
-ENV_SYMBOLS = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
-SYMBOLS = [s.strip().upper() for s in ENV_SYMBOLS.split(",") if s.strip()]
+DEFAULT_SYMBOLS = "BTCUSDT,BNBUSDT,SUIUSDT,ADAUSDT,XRPUSDT,ANKRUSDT"
+SYMBOLS_FILE = os.path.join(os.path.dirname(__file__), "symbols.json")
+STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
+
+def load_symbols() -> list:
+    """Charge les symboles enregistrés par l'utilisateur depuis Telegram."""
+    if os.path.exists(SYMBOLS_FILE):
+        try:
+            with open(SYMBOLS_FILE, "r") as f:
+                saved = json.load(f)
+                if isinstance(saved, list) and len(saved) > 0:
+                    return saved
+        except Exception as e:
+            print(f"[!] Erreur lecture symbols.json : {e}")
+    
+    env_syms = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
+    return [s.strip().upper() for s in env_syms.split(",") if s.strip()]
+
+def save_symbols(symbols_list: list) -> None:
+    """Sauvegarde la liste actuelle des symboles dans symbols.json."""
+    try:
+        with open(SYMBOLS_FILE, "w") as f:
+            json.dump(symbols_list, f, indent=2)
+    except Exception as e:
+        print(f"[!] Erreur sauvegarde symbols.json : {e}")
+
+# Initialisation de la liste des symboles
+SYMBOLS = load_symbols()
 
 SIGNAL_TIMEFRAME = "4h"
 HTF_TIMEFRAME = "4h"
@@ -31,7 +56,7 @@ LEN_TREND = 35  # MA35
 LEN_SLOW = 55   # EMA55
 
 RETEST_WINDOW = 20
-LOOKBACK_4H = 5
+LOOKBACK_4H = 20  # 20 bougies de 4h (80h) pour la structure du marché
 
 USE_TREND_FILTER = True
 USE_RR_FILTER = True
@@ -42,18 +67,14 @@ SIGNAL_SOURCE = "both"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 BINANCE_KLINES_URL = "https://api1.binance.com/api/v3/klines"
 
-# Secret de sécurité pour l'URL du webhook Telegram (évite qu'un tiers
-# devine l'URL et poste de faux updates). On peut le fixer via variable
-# d'env, sinon il est dérivé du token du bot.
+# Secret de sécurité pour le Webhook
 WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip() or (
     hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()[:16] if TELEGRAM_BOT_TOKEN else "no-token"
 )
 
-# Cache en mémoire : dernier snapshot d'indicateurs calculé par symbole,
-# rempli à chaque run (auto ou /scan), consulté par /signals.
+# Cache en mémoire : dernier snapshot d'indicateurs calculé par symbole
 LAST_DIAGNOSTIC: dict = {}
 
 
@@ -74,11 +95,7 @@ def send_telegram_message(text: str) -> bool:
     }
     try:
         resp = requests.post(url, data=payload, timeout=15)
-        if resp.ok:
-            return True
-        else:
-            print(f"[!] Échec envoi Telegram ({resp.status_code}): {resp.text}")
-            return False
+        return resp.ok
     except Exception as e:
         print(f"[!] Erreur de connexion Telegram: {e}")
         return False
@@ -175,8 +192,8 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["retest_long"] = retest_long
     df["retest_short"] = retest_short
 
-    trend_up = df["close"] > df["ma35"]
-    trend_down = df["close"] < df["ma35"]
+    trend_up = df["close"] > df["ma55"]
+    trend_down = df["close"] < df["ma55"]
 
     risk_long = df["close"] - df["pl4h"]
     reward_long = df["ph4h"] - df["close"]
@@ -259,8 +276,6 @@ def process_symbol(symbol: str, state: dict) -> int:
         ("retest", "SHORT", "retest_short_signal"),
     ]
 
-    # --- Diagnostic : toujours visible dans les logs, meme si aucun signal
-    # n'est envoye. Permet de verifier ce que le bot a reellement calcule.
     last_row = df_signal.iloc[-1]
     diag = {
         "close_time": last_row["close_time"].strftime("%Y-%m-%d %H:%M UTC"),
@@ -279,16 +294,6 @@ def process_symbol(symbol: str, state: dict) -> int:
         "rr_ok_short": bool(last_row["rr_ok_short"]),
     }
     LAST_DIAGNOSTIC[symbol] = diag
-    print(
-        f"[DIAG] {symbol} @ {diag['close_time']} | "
-        f"close={diag['close']:.6g} ma25={diag['ma25']:.6g} "
-        f"ma35={diag['ma35']:.6g} ma55={diag['ma55']:.6g} | "
-        f"breakout_up={diag['breakout_up']} breakout_down={diag['breakout_down']} "
-        f"retest_long={diag['retest_long']} retest_short={diag['retest_short']} | "
-        f"trend_up={diag['trend_up']} "
-        f"rr_long={diag['rr_long']:.2f} rr_ok_long={diag['rr_ok_long']} "
-        f"rr_short={diag['rr_short']:.2f} rr_ok_short={diag['rr_ok_short']}"
-    )
 
     for idx in [-2, -1]:
         row = df_signal.iloc[idx]
@@ -315,7 +320,7 @@ def main():
     state = load_state()
     total_signals = 0
 
-    for symbol in SYMBOLS:
+    for symbol in list(SYMBOLS):
         try:
             total_signals += process_symbol(symbol, state)
         except Exception as e:
@@ -327,11 +332,10 @@ def main():
 
 
 # =====================================================================
-# COMMANDES TELEGRAM (/scan, /signals, /add, /remove)
+# COMMANDES TELEGRAM PERSISTANTES (/scan, /signals, /add, /remove)
 # =====================================================================
 
 def run_scan_and_notify() -> None:
-    """Lance une analyse immédiate de tous les symboles suivis (déclenché par /scan)."""
     send_telegram_message("🔍 Scan manuel en cours...")
     state = load_state()
     total = 0
@@ -343,13 +347,13 @@ def run_scan_and_notify() -> None:
         time.sleep(0.3)
     save_state(state)
     send_telegram_message(
-        f"✅ Scan terminé. {total} signal(aux) envoyé(s). Tape /signals pour le détail des indicateurs."
+        f"✅ Scan terminé. {total} signal(aux) envoyé(s). Tape /signals pour voir le snapshot."
     )
 
 
 def format_signals_snapshot() -> str:
     if not LAST_DIAGNOSTIC:
-        return "Aucune donnée pour le moment — attends le premier run ou tape /scan."
+        return "Aucune donnée pour le moment — tape /scan."
     lines = ["📊 <b>Dernier snapshot par symbole</b>"]
     for symbol, d in LAST_DIAGNOSTIC.items():
         lines.append(
@@ -371,33 +375,38 @@ def handle_add(symbol_raw: str) -> None:
         send_telegram_message("Usage : /add BTCUSDT")
         return
     if symbol in SYMBOLS:
-        send_telegram_message(f"{symbol} est déjà suivi.")
+        send_telegram_message(f"{symbol} est déjà dans la liste.")
         return
     try:
         fetch_klines(symbol, SIGNAL_TIMEFRAME, limit=5)
     except Exception:
-        send_telegram_message(f"❌ Impossible de valider {symbol} sur Binance (symbole invalide ?).")
+        send_telegram_message(f"❌ Impossible de trouver {symbol} sur Binance (vérifiez l'orthographe).")
         return
+    
     SYMBOLS.append(symbol)
-    send_telegram_message(f"✅ {symbol} ajouté. Liste suivie ({len(SYMBOLS)}) : {', '.join(SYMBOLS)}")
+    save_symbols(SYMBOLS)  # Sauvegarde permanente
+    send_telegram_message(f"✅ {symbol} sauvegardé ! Liste actuelle ({len(SYMBOLS)}) : {', '.join(SYMBOLS)}")
 
 
 def handle_remove(symbol_raw: str) -> None:
+    global SYMBOLS
     symbol = symbol_raw.strip().upper()
     if symbol not in SYMBOLS:
-        send_telegram_message(f"{symbol} n'est pas dans la liste suivie.")
+        send_telegram_message(f"{symbol} n'est pas dans la liste.")
         return
+    
     SYMBOLS.remove(symbol)
+    save_symbols(SYMBOLS)  # Sauvegarde permanente
     LAST_DIAGNOSTIC.pop(symbol, None)
     reste = ', '.join(SYMBOLS) if SYMBOLS else "(vide)"
-    send_telegram_message(f"🗑 {symbol} retiré. Liste actuelle : {reste}")
+    send_telegram_message(f"🗑 {symbol} retiré définitivement. Liste restante : {reste}")
 
 
 def handle_command(text: str) -> None:
     parts = text.strip().split()
     if not parts:
         return
-    cmd = parts[0].lower().split("@")[0]  # tolère "/scan@monbot"
+    cmd = parts[0].lower().split("@")[0]
     arg = parts[1] if len(parts) > 1 else ""
 
     if cmd == "/scan":
@@ -408,27 +417,24 @@ def handle_command(text: str) -> None:
         handle_add(arg)
     elif cmd == "/remove":
         handle_remove(arg)
-    elif cmd == "/start" or cmd == "/help":
+    elif cmd in ("/start", "/help"):
         send_telegram_message(
-            "Commandes disponibles :\n"
-            "/scan — lance une analyse immédiate\n"
-            "/signals — dernier snapshot d'indicateurs par symbole (même filtré)\n"
-            "/add SYMBOLE — ajoute un symbole (ex: /add DOGEUSDT)\n"
-            "/remove SYMBOLE — retire un symbole"
+            "<b>Commandes disponibles :</b>\n"
+            "/scan — Lance un scan immédiat du marché\n"
+            "/signals — Affiche l'état technique actuel\n"
+            "/add SYMBOLE — Enregistre une paire (ex: /add ANKRUSDT)\n"
+            "/remove SYMBOLE — Supprime une paire (ex: /remove SUIUSDT)"
         )
     else:
-        send_telegram_message("Commande inconnue. Tape /help pour la liste.")
+        send_telegram_message("Commande inconnue. Tapez /help.")
 
 
 def register_webhook() -> None:
-    """Indique à Telegram où envoyer les updates (nécessite un Web Service
-    Render avec URL publique — pas un Background Worker)."""
     if not TELEGRAM_BOT_TOKEN:
         return
     base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not base_url:
-        print("[!] RENDER_EXTERNAL_URL introuvable — webhook non configuré. "
-              "Vérifie que le service Render est bien un 'Web Service' (pas un Background Worker).")
+        print("[!] RENDER_EXTERNAL_URL non définie.")
         return
     webhook_url = f"{base_url}/telegram/{WEBHOOK_SECRET}"
     try:
@@ -437,13 +443,13 @@ def register_webhook() -> None:
             params={"url": webhook_url},
             timeout=15,
         )
-        print(f"[Webhook] setWebhook -> {resp.status_code} {resp.text}")
+        print(f"[Webhook] Configuré : {resp.status_code}")
     except Exception as e:
-        print(f"[!] Erreur configuration webhook: {e}")
+        print(f"[!] Erreur Webhook: {e}")
 
 
 # =====================================================================
-# CONFIGURATION SERVEUR RENDER & BOUCLE CONTINU 24/7
+# SERVEUR WEB & BOUCLE PRINCIPALE
 # =====================================================================
 
 app = Flask(__name__)
@@ -463,15 +469,13 @@ def telegram_webhook():
     if not text:
         return "ok", 200
     if not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
-        # Ignore silencieusement tout message venant d'un autre chat.
-        print(f"[!] Commande ignorée depuis chat_id non autorisé: {chat_id}")
         return "ok", 200
 
     try:
         handle_command(text)
     except Exception as e:
         print(f"[ERREUR commande] {e}")
-        send_telegram_message(f"⚠️ Erreur en traitant la commande : {e}")
+        send_telegram_message(f"⚠️ Erreur lors du traitement : {e}")
 
     return "ok", 200
 
@@ -481,23 +485,19 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 def main_loop():
-    print("🤖 Bot démarré sur serveur 24/7...")
-    send_telegram_message("🚀 Bot d'analyse démarré en continu sur Render (24/7) !")
+    print("🤖 Bot démarré avec persistance...")
+    send_telegram_message("🚀 Bot opérationnel (paires sauvegardées).")
     
     while True:
         try:
             main()
         except Exception as e:
-            print(f"[!] Erreur durant l'exécution : {e}")
+            print(f"[!] Erreur durant le scan : {e}")
         
-        print("💤 En attente du prochain intervalle (1 heure)...")
         time.sleep(3600)
 
 if __name__ == "__main__":
-    # Démarre le serveur web en arrière-plan
     threading.Thread(target=run_flask, daemon=True).start()
-    # Laisse le temps au serveur Flask de bind le port avant d'enregistrer le webhook
     time.sleep(2)
     register_webhook()
-    # Démarre la boucle infinie d'analyse
     main_loop()
