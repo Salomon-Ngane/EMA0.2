@@ -22,7 +22,7 @@ DEFAULT_SYMBOLS = "BTCUSDT,BNBUSDT,SUIUSDT,ADAUSDT,XRPUSDT"
 ENV_SYMBOLS = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
 SYMBOLS = [s.strip().upper() for s in ENV_SYMBOLS.split(",") if s.strip()]
 
-SIGNAL_TIMEFRAME = "2h"
+SIGNAL_TIMEFRAME = "4h"
 HTF_TIMEFRAME = "4h"
 
 LEN_FAST = 10   # EMA verte
@@ -30,11 +30,11 @@ LEN_TREND = 35  # MA35
 LEN_SLOW = 55   # EMA55
 
 RETEST_WINDOW = 20
-LOOKBACK_4H = 5
+LOOKBACK_4H = 20  # Augmenté à 20 bougies (80h) pour capturer de vrais sommets/creux de structure
 
 USE_TREND_FILTER = True
 USE_RR_FILTER = True
-MIN_RR = 1.5   
+MIN_RR = 2.7   
 
 SIGNAL_SOURCE = "both"
 
@@ -163,8 +163,9 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["retest_long"] = retest_long
     df["retest_short"] = retest_short
 
-    trend_up = df["close"] > df["ma35"]
-    trend_down = df["close"] < df["ma35"]
+    # Filtre de tendance aligné sur la moyenne dynamique intermédiaire (MA35/MA55)
+    trend_up = df["close"] > df["ma55"]
+    trend_down = df["close"] < df["ma55"]
 
     risk_long = df["close"] - df["pl4h"]
     reward_long = df["ph4h"] - df["close"]
@@ -194,6 +195,10 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     df["rr_long"] = rr_long
     df["rr_short"] = rr_short
+    df["trend_up"] = trend_up
+    df["trend_down"] = trend_down
+    df["rr_ok_long"] = rr_ok_long
+    df["rr_ok_short"] = rr_ok_short
 
     return df
 
@@ -242,6 +247,20 @@ def process_symbol(symbol: str, state: dict) -> int:
         ("retest", "LONG", "retest_long_signal"),
         ("retest", "SHORT", "retest_short_signal"),
     ]
+
+    last_row = df_signal.iloc[-1]
+    print(
+        f"[DIAG] {symbol} @ {last_row['close_time'].isoformat()} | "
+        f"close={last_row['close']:.6g} ma25={last_row['ma25']:.6g} "
+        f"ma35={last_row['ma35']:.6g} ma55={last_row['ma55']:.6g} | "
+        f"breakout_up={bool(last_row['breakout_up'])} "
+        f"breakout_down={bool(last_row['breakout_down'])} "
+        f"retest_long={bool(last_row['retest_long'])} "
+        f"retest_short={bool(last_row['retest_short'])} | "
+        f"trend_up={bool(last_row['trend_up'])} "
+        f"rr_long={last_row['rr_long']:.2f} rr_ok_long={bool(last_row['rr_ok_long'])} "
+        f"rr_short={last_row['rr_short']:.2f} rr_ok_short={bool(last_row['rr_ok_short'])}"
+    )
 
     for idx in [-2, -1]:
         row = df_signal.iloc[idx]
@@ -307,8 +326,5 @@ def main_loop():
         time.sleep(3600)
 
 if __name__ == "__main__":
-    # Démarre le serveur web en arrière-plan
     threading.Thread(target=run_flask, daemon=True).start()
-    # Démarre la boucle infinie d'analyse
     main_loop()
-
