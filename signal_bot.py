@@ -7,12 +7,13 @@ Version optimisée 24/7 pour Render (Flask Health Check + Boucle continue)
 import os
 import json
 import time
+import hashlib
 import threading
 from datetime import datetime, timezone
 
 import requests
 import pandas as pd
-from flask import Flask
+from flask import Flask, request
 
 # =====================================================================
 # CONFIGURATION - Ajustée pour recevoir des signaux réguliers
@@ -30,7 +31,7 @@ LEN_TREND = 35  # MA35
 LEN_SLOW = 55   # EMA55
 
 RETEST_WINDOW = 20
-LOOKBACK_4H = 20  # Augmenté à 20 bougies (80h) pour capturer de vrais sommets/creux de structure
+LOOKBACK_4H = 5
 
 USE_TREND_FILTER = True
 USE_RR_FILTER = True
@@ -43,6 +44,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 BINANCE_KLINES_URL = "https://api1.binance.com/api/v3/klines"
+
+# Secret de sécurité pour l'URL du webhook Telegram (évite qu'un tiers
+# devine l'URL et poste de faux updates). On peut le fixer via variable
+# d'env, sinon il est dérivé du token du bot.
+WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip() or (
+    hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()[:16] if TELEGRAM_BOT_TOKEN else "no-token"
+)
+
+# Cache en mémoire : dernier snapshot d'indicateurs calculé par symbole,
+# rempli à chaque run (auto ou /scan), consulté par /signals.
+LAST_DIAGNOSTIC: dict = {}
 
 
 # =====================================================================
@@ -163,9 +175,8 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
     df["retest_long"] = retest_long
     df["retest_short"] = retest_short
 
-    # Filtre de tendance aligné sur la moyenne dynamique intermédiaire (MA35/MA55)
-    trend_up = df["close"] > df["ma55"]
-    trend_down = df["close"] < df["ma55"]
+    trend_up = df["close"] > df["ma35"]
+    trend_down = df["close"] < df["ma35"]
 
     risk_long = df["close"] - df["pl4h"]
     reward_long = df["ph4h"] - df["close"]
@@ -248,18 +259,35 @@ def process_symbol(symbol: str, state: dict) -> int:
         ("retest", "SHORT", "retest_short_signal"),
     ]
 
+    # --- Diagnostic : toujours visible dans les logs, meme si aucun signal
+    # n'est envoye. Permet de verifier ce que le bot a reellement calcule.
     last_row = df_signal.iloc[-1]
+    diag = {
+        "close_time": last_row["close_time"].strftime("%Y-%m-%d %H:%M UTC"),
+        "close": float(last_row["close"]),
+        "ma25": float(last_row["ma25"]),
+        "ma35": float(last_row["ma35"]),
+        "ma55": float(last_row["ma55"]),
+        "breakout_up": bool(last_row["breakout_up"]),
+        "breakout_down": bool(last_row["breakout_down"]),
+        "retest_long": bool(last_row["retest_long"]),
+        "retest_short": bool(last_row["retest_short"]),
+        "trend_up": bool(last_row["trend_up"]),
+        "rr_long": float(last_row["rr_long"]) if pd.notna(last_row["rr_long"]) else float("nan"),
+        "rr_ok_long": bool(last_row["rr_ok_long"]),
+        "rr_short": float(last_row["rr_short"]) if pd.notna(last_row["rr_short"]) else float("nan"),
+        "rr_ok_short": bool(last_row["rr_ok_short"]),
+    }
+    LAST_DIAGNOSTIC[symbol] = diag
     print(
-        f"[DIAG] {symbol} @ {last_row['close_time'].isoformat()} | "
-        f"close={last_row['close']:.6g} ma25={last_row['ma25']:.6g} "
-        f"ma35={last_row['ma35']:.6g} ma55={last_row['ma55']:.6g} | "
-        f"breakout_up={bool(last_row['breakout_up'])} "
-        f"breakout_down={bool(last_row['breakout_down'])} "
-        f"retest_long={bool(last_row['retest_long'])} "
-        f"retest_short={bool(last_row['retest_short'])} | "
-        f"trend_up={bool(last_row['trend_up'])} "
-        f"rr_long={last_row['rr_long']:.2f} rr_ok_long={bool(last_row['rr_ok_long'])} "
-        f"rr_short={last_row['rr_short']:.2f} rr_ok_short={bool(last_row['rr_ok_short'])}"
+        f"[DIAG] {symbol} @ {diag['close_time']} | "
+        f"close={diag['close']:.6g} ma25={diag['ma25']:.6g} "
+        f"ma35={diag['ma35']:.6g} ma55={diag['ma55']:.6g} | "
+        f"breakout_up={diag['breakout_up']} breakout_down={diag['breakout_down']} "
+        f"retest_long={diag['retest_long']} retest_short={diag['retest_short']} | "
+        f"trend_up={diag['trend_up']} "
+        f"rr_long={diag['rr_long']:.2f} rr_ok_long={diag['rr_ok_long']} "
+        f"rr_short={diag['rr_short']:.2f} rr_ok_short={diag['rr_ok_short']}"
     )
 
     for idx in [-2, -1]:
@@ -299,6 +327,122 @@ def main():
 
 
 # =====================================================================
+# COMMANDES TELEGRAM (/scan, /signals, /add, /remove)
+# =====================================================================
+
+def run_scan_and_notify() -> None:
+    """Lance une analyse immédiate de tous les symboles suivis (déclenché par /scan)."""
+    send_telegram_message("🔍 Scan manuel en cours...")
+    state = load_state()
+    total = 0
+    for symbol in list(SYMBOLS):
+        try:
+            total += process_symbol(symbol, state)
+        except Exception as e:
+            print(f"[ERREUR scan manuel] {symbol}: {e}")
+        time.sleep(0.3)
+    save_state(state)
+    send_telegram_message(
+        f"✅ Scan terminé. {total} signal(aux) envoyé(s). Tape /signals pour le détail des indicateurs."
+    )
+
+
+def format_signals_snapshot() -> str:
+    if not LAST_DIAGNOSTIC:
+        return "Aucune donnée pour le moment — attends le premier run ou tape /scan."
+    lines = ["📊 <b>Dernier snapshot par symbole</b>"]
+    for symbol, d in LAST_DIAGNOSTIC.items():
+        lines.append(
+            f"\n<b>{symbol}</b> @ {d['close_time']}\n"
+            f"Prix: {d['close']:.6g} | MA25:{d['ma25']:.6g} MA35:{d['ma35']:.6g} MA55:{d['ma55']:.6g}\n"
+            f"Breakout ↑{d['breakout_up']} ↓{d['breakout_down']} | "
+            f"Retest ↑{d['retest_long']} ↓{d['retest_short']}\n"
+            f"Tendance haussière: {d['trend_up']} | "
+            f"RR long: {d['rr_long']:.2f} (ok={d['rr_ok_long']}) — "
+            f"RR short: {d['rr_short']:.2f} (ok={d['rr_ok_short']})"
+        )
+    return "\n".join(lines)
+
+
+def handle_add(symbol_raw: str) -> None:
+    global SYMBOLS
+    symbol = symbol_raw.strip().upper()
+    if not symbol:
+        send_telegram_message("Usage : /add BTCUSDT")
+        return
+    if symbol in SYMBOLS:
+        send_telegram_message(f"{symbol} est déjà suivi.")
+        return
+    try:
+        fetch_klines(symbol, SIGNAL_TIMEFRAME, limit=5)
+    except Exception:
+        send_telegram_message(f"❌ Impossible de valider {symbol} sur Binance (symbole invalide ?).")
+        return
+    SYMBOLS.append(symbol)
+    send_telegram_message(f"✅ {symbol} ajouté. Liste suivie ({len(SYMBOLS)}) : {', '.join(SYMBOLS)}")
+
+
+def handle_remove(symbol_raw: str) -> None:
+    symbol = symbol_raw.strip().upper()
+    if symbol not in SYMBOLS:
+        send_telegram_message(f"{symbol} n'est pas dans la liste suivie.")
+        return
+    SYMBOLS.remove(symbol)
+    LAST_DIAGNOSTIC.pop(symbol, None)
+    reste = ', '.join(SYMBOLS) if SYMBOLS else "(vide)"
+    send_telegram_message(f"🗑 {symbol} retiré. Liste actuelle : {reste}")
+
+
+def handle_command(text: str) -> None:
+    parts = text.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lower().split("@")[0]  # tolère "/scan@monbot"
+    arg = parts[1] if len(parts) > 1 else ""
+
+    if cmd == "/scan":
+        threading.Thread(target=run_scan_and_notify, daemon=True).start()
+    elif cmd == "/signals":
+        send_telegram_message(format_signals_snapshot())
+    elif cmd == "/add":
+        handle_add(arg)
+    elif cmd == "/remove":
+        handle_remove(arg)
+    elif cmd == "/start" or cmd == "/help":
+        send_telegram_message(
+            "Commandes disponibles :\n"
+            "/scan — lance une analyse immédiate\n"
+            "/signals — dernier snapshot d'indicateurs par symbole (même filtré)\n"
+            "/add SYMBOLE — ajoute un symbole (ex: /add DOGEUSDT)\n"
+            "/remove SYMBOLE — retire un symbole"
+        )
+    else:
+        send_telegram_message("Commande inconnue. Tape /help pour la liste.")
+
+
+def register_webhook() -> None:
+    """Indique à Telegram où envoyer les updates (nécessite un Web Service
+    Render avec URL publique — pas un Background Worker)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    base_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not base_url:
+        print("[!] RENDER_EXTERNAL_URL introuvable — webhook non configuré. "
+              "Vérifie que le service Render est bien un 'Web Service' (pas un Background Worker).")
+        return
+    webhook_url = f"{base_url}/telegram/{WEBHOOK_SECRET}"
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+            params={"url": webhook_url},
+            timeout=15,
+        )
+        print(f"[Webhook] setWebhook -> {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[!] Erreur configuration webhook: {e}")
+
+
+# =====================================================================
 # CONFIGURATION SERVEUR RENDER & BOUCLE CONTINU 24/7
 # =====================================================================
 
@@ -307,6 +451,30 @@ app = Flask(__name__)
 @app.route('/')
 def health_check():
     return "Bot is alive!", 200
+
+
+@app.route(f"/telegram/{WEBHOOK_SECRET}", methods=["POST"])
+def telegram_webhook():
+    update = request.get_json(force=True, silent=True) or {}
+    message = update.get("message") or update.get("edited_message") or {}
+    text = (message.get("text") or "").strip()
+    chat_id = str(message.get("chat", {}).get("id", ""))
+
+    if not text:
+        return "ok", 200
+    if not TELEGRAM_CHAT_ID or chat_id != TELEGRAM_CHAT_ID:
+        # Ignore silencieusement tout message venant d'un autre chat.
+        print(f"[!] Commande ignorée depuis chat_id non autorisé: {chat_id}")
+        return "ok", 200
+
+    try:
+        handle_command(text)
+    except Exception as e:
+        print(f"[ERREUR commande] {e}")
+        send_telegram_message(f"⚠️ Erreur en traitant la commande : {e}")
+
+    return "ok", 200
+
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -326,5 +494,10 @@ def main_loop():
         time.sleep(3600)
 
 if __name__ == "__main__":
+    # Démarre le serveur web en arrière-plan
     threading.Thread(target=run_flask, daemon=True).start()
+    # Laisse le temps au serveur Flask de bind le port avant d'enregistrer le webhook
+    time.sleep(2)
+    register_webhook()
+    # Démarre la boucle infinie d'analyse
     main_loop()
