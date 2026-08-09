@@ -38,46 +38,44 @@ DEFAULT_ASSETS = {
 }
 
 def load_state():
-    """Charge la liste des actifs depuis la base de données Supabase."""
+    """Charge la liste des actifs depuis Supabase ou renvoie la liste par défaut."""
     if not supabase:
-        logging.warning("Supabase non configuré, retour des actifs par défaut.")
-        return DEFAULT_ASSETS
+        logging.warning("Supabase non connecté. Utilisation de la liste locale par défaut.")
+        return DEFAULT_ASSETS.copy()
     
     try:
         response = supabase.table("state").select("data").eq("id", 1).execute()
         if response.data and len(response.data) > 0 and response.data[0]["data"]:
             return response.data[0]["data"]
     except Exception as e:
-        logging.error(f"Erreur lors du chargement depuis Supabase : {e}")
+        logging.error(f"Erreur chargement Supabase : {e}")
     
-    return DEFAULT_ASSETS
+    return DEFAULT_ASSETS.copy()
 
 def save_state(state):
     """Sauvegarde la liste des actifs dans Supabase."""
     if not supabase:
-        logging.error("Impossible de sauvegarder, Supabase non configuré.")
+        logging.error("Impossible de sauvegarder : Supabase non configuré.")
         return
         
     try:
         supabase.table("state").update({"data": state}).eq("id", 1).execute()
     except Exception as e:
-        logging.error(f"Erreur lors de la sauvegarde dans Supabase : {e}")
+        logging.error(f"Erreur sauvegarde Supabase : {e}")
 
-# Global state loaded from Supabase
+# Charge l'état global au lancement
 STATE = load_state()
-
-# Global Telegram Application Instance
 telegram_app = None
 
 async def fetch_ohlcv(symbol, timeframe="1h", limit=100):
-    exchange = ccxt.binance()
+    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         return df
     except Exception as e:
-        logging.error(f"Error fetching data for {symbol}: {e}")
+        logging.error(f"Erreur récupération données pour {symbol}: {e}")
         return None
     finally:
         await exchange.close()
@@ -91,23 +89,20 @@ def calculate_indicators(df):
 def generate_signal(df):
     if len(df) < 2:
         return None
-    
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Bullish Cross
     if prev['ema_20'] <= prev['ema_50'] and curr['ema_20'] > curr['ema_50']:
         return "BUY"
-    # Bearish Cross
     elif prev['ema_20'] >= prev['ema_50'] and curr['ema_20'] < curr['ema_50']:
         return "SELL"
-    
     return None
 
 async def run_scan_job():
-    logging.info("Starting market scan...")
+    logging.info("Lancement du scan des marchés...")
     signals_sent = 0
-    for symbol, config in STATE.items():
+    
+    for symbol, config in list(STATE.items()):
         if not config.get("enabled", True):
             continue
         
@@ -121,7 +116,7 @@ async def run_scan_job():
         df = calculate_indicators(df)
         signal = generate_signal(df)
         
-        if signal:
+        if signal and telegram_app and TELEGRAM_CHAT_ID:
             curr_price = df.iloc[-1]['close']
             rsi_val = round(df.iloc[-1]['rsi'], 2)
             
@@ -132,25 +127,27 @@ async def run_scan_job():
                 f"**Price:** {curr_price}\n"
                 f"**RSI:** {rsi_val}\n"
                 f"**Timeframe:** {timeframe}\n"
-                f"**Suggested Leverage:** {leverage}x"
+                f"**Leverage:** {leverage}x"
             )
-            
-            if telegram_app and TELEGRAM_CHAT_ID:
-                try:
-                    await telegram_app.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID, 
-                        text=message, 
-                        parse_mode="Markdown"
-                    )
-                    signals_sent += 1
-                except Exception as e:
-                    logging.error(f"Erreur d'envoi Telegram : {e}")
+            try:
+                await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+                signals_sent += 1
+            except Exception as e:
+                logging.error(f"Erreur envoi message Telegram : {e}")
                 
-    logging.info(f"Market scan finished. {signals_sent} signals sent.")
+    # Message de confirmation de fin de scan
+    if telegram_app and TELEGRAM_CHAT_ID:
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, 
+                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Le bot reste opérationnel."
+            )
+        except Exception as e:
+            logging.error(f"Erreur envoi notification fin de scan : {e}")
 
-# Telegram Command Handlers
+# Commandes Telegram
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot EMA Signal en ligne. Utilisez /list pour voir les actifs configurés.")
+    await update.message.reply_text("Bot EMA Signal opérationnel ! Utilisez /list pour voir les actifs configurés.")
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not STATE:
@@ -177,7 +174,7 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE[symbol] = {"enabled": True, "timeframe": tf, "leverage": lev}
     save_state(STATE)
     
-    await update.message.reply_text(f"✅ Actif **{symbol}** ajouté et sauvegardé sur Supabase !", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Actif **{symbol}** ajouté et enregistré !", parse_mode="Markdown")
 
 async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -189,28 +186,14 @@ async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if symbol in STATE:
         del STATE[symbol]
         save_state(STATE)
-        await update.message.reply_text(f"🗑️ Actif **{symbol}** supprimé de Supabase !", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑️ Actif **{symbol}** supprimé !", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"Actif {symbol} introuvable.")
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Lancement du scan manuel...")
-    await run_scan_job()
-    await update.message.reply_text("Scan terminé !")
+    asyncio.create_task(run_scan_job())
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    supabase_ok = "✅ Connecté" if supabase else "❌ Non configuré"
-    total_assets = len(STATE)
-    
-    msg = (
-        f"📊 **Statut du Bot :**\n\n"
-        f"• Base de données (Supabase) : {supabase_ok}\n"
-        f"• Actifs enregistrés : {total_assets}\n"
-        f"• Serveur Web (/scan) : ✅ Actif sur le port {PORT}"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# Web Server Route for Cron Trigger (/scan)
 async def handle_scan_request(request):
     asyncio.create_task(run_scan_job())
     return web.Response(text="Scan Job triggered successfully.")
@@ -218,7 +201,7 @@ async def handle_scan_request(request):
 async def main():
     global telegram_app
     
-    # 1. Setup Aiohttp Web Server First
+    # 1. Démarrage du serveur Web (pour Cron-Job)
     server = web.Application()
     server.router.add_get('/scan', handle_scan_request)
     server.router.add_get('/', lambda r: web.Response(text="Signal Bot is Running."))
@@ -227,30 +210,21 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logging.info(f"Web server running on port {PORT}")
 
-    # 2. Initialize Telegram Application if token exists
+    # 2. Initialisation du Bot Telegram
     if TELEGRAM_BOT_TOKEN:
-        try:
-            telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            
-            telegram_app.add_handler(CommandHandler("start", start_cmd))
-            telegram_app.add_handler(CommandHandler("list", list_cmd))
-            telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
-            telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
-            telegram_app.add_handler(CommandHandler("scan", scan_cmd))
-            telegram_app.add_handler(CommandHandler("status", status_cmd))
-            
-            await telegram_app.initialize()
-            await telegram_app.start()
-            await telegram_app.updater.start_polling()
-            logging.info("Telegram Bot polling started successfully.")
-        except Exception as e:
-            logging.error(f"Erreur d'initialisation Telegram Bot : {e}")
-    else:
-        logging.warning("TELEGRAM_BOT_TOKEN manquant dans les variables d'environnement.")
+        telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        telegram_app.add_handler(CommandHandler("start", start_cmd))
+        telegram_app.add_handler(CommandHandler("list", list_cmd))
+        telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
+        telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
+        telegram_app.add_handler(CommandHandler("scan", scan_cmd))
+        
+        await telegram_app.initialize()
+        await telegram_app.start()
+        await telegram_app.updater.start_polling(drop_pending_updates=True)
     
-    # Keep application running indefinitely
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
