@@ -21,7 +21,12 @@ PORT = int(os.getenv("PORT", 8080))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        logging.error(f"Erreur d'initialisation Supabase : {e}")
 
 # Default Assets Configuration
 DEFAULT_ASSETS = {
@@ -131,12 +136,15 @@ async def run_scan_job():
             )
             
             if telegram_app and TELEGRAM_CHAT_ID:
-                await telegram_app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, 
-                    text=message, 
-                    parse_mode="Markdown"
-                )
-                signals_sent += 1
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=TELEGRAM_CHAT_ID, 
+                        text=message, 
+                        parse_mode="Markdown"
+                    )
+                    signals_sent += 1
+                except Exception as e:
+                    logging.error(f"Erreur d'envoi Telegram : {e}")
                 
     logging.info(f"Market scan finished. {signals_sent} signals sent.")
 
@@ -157,7 +165,6 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Usage: /add_asset BTC/USDT 1h 10
     args = context.args
     if len(args) < 1:
         await update.message.reply_text("Usage: /add_asset <SYMBOL> [timeframe] [leverage]\nExemple: /add_asset SOL/USDT 1h 10")
@@ -173,7 +180,6 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Actif **{symbol}** ajouté et sauvegardé sur Supabase !", parse_mode="Markdown")
 
 async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Usage: /remove_asset BTC/USDT
     args = context.args
     if len(args) < 1:
         await update.message.reply_text("Usage: /remove_asset <SYMBOL>")
@@ -192,6 +198,18 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan_job()
     await update.message.reply_text("Scan terminé !")
 
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    supabase_ok = "✅ Connecté" if supabase else "❌ Non configuré"
+    total_assets = len(STATE)
+    
+    msg = (
+        f"📊 **Statut du Bot :**\n\n"
+        f"• Base de données (Supabase) : {supabase_ok}\n"
+        f"• Actifs enregistrés : {total_assets}\n"
+        f"• Serveur Web (/scan) : ✅ Actif sur le port {PORT}"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 # Web Server Route for Cron Trigger (/scan)
 async def handle_scan_request(request):
     asyncio.create_task(run_scan_job())
@@ -200,20 +218,7 @@ async def handle_scan_request(request):
 async def main():
     global telegram_app
     
-    # 1. Initialize Telegram Application
-    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    telegram_app.add_handler(CommandHandler("start", start_cmd))
-    telegram_app.add_handler(CommandHandler("list", list_cmd))
-    telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
-    telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
-    telegram_app.add_handler(CommandHandler("scan", scan_cmd))
-    
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling()
-    
-    # 2. Setup Aiohttp Web Server
+    # 1. Setup Aiohttp Web Server First
     server = web.Application()
     server.router.add_get('/scan', handle_scan_request)
     server.router.add_get('/', lambda r: web.Response(text="Signal Bot is Running."))
@@ -222,8 +227,28 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    
     logging.info(f"Web server running on port {PORT}")
+
+    # 2. Initialize Telegram Application if token exists
+    if TELEGRAM_BOT_TOKEN:
+        try:
+            telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+            
+            telegram_app.add_handler(CommandHandler("start", start_cmd))
+            telegram_app.add_handler(CommandHandler("list", list_cmd))
+            telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
+            telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
+            telegram_app.add_handler(CommandHandler("scan", scan_cmd))
+            telegram_app.add_handler(CommandHandler("status", status_cmd))
+            
+            await telegram_app.initialize()
+            await telegram_app.start()
+            await telegram_app.updater.start_polling()
+            logging.info("Telegram Bot polling started successfully.")
+        except Exception as e:
+            logging.error(f"Erreur d'initialisation Telegram Bot : {e}")
+    else:
+        logging.warning("TELEGRAM_BOT_TOKEN manquant dans les variables d'environnement.")
     
     # Keep application running indefinitely
     await asyncio.Event().wait()
