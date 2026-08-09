@@ -1,4 +1,8 @@
-requests>=2.31.0
+python-telegram-bot
+aiohttp
+ccxt
 pandas>=2.0.0
-flask>=3.0.0
+ta
 supabase
+requests>=2.31.0
+
