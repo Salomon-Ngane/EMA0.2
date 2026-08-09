@@ -28,17 +28,17 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         logging.error(f"Erreur d'initialisation Supabase : {e}")
 
-# Default Assets Configuration
+# Default Assets Configuration (Timeframe par défaut : 4h)
 DEFAULT_ASSETS = {
-    "BTC/USDT": {"enabled": True, "timeframe": "1h", "leverage": 10},
-    "ETH/USDT": {"enabled": True, "timeframe": "1h", "leverage": 10},
-    "SOL/USDT": {"enabled": True, "timeframe": "1h", "leverage": 10},
-    "BNB/USDT": {"enabled": True, "timeframe": "1h", "leverage": 10},
-    "XRP/USDT": {"enabled": True, "timeframe": "1h", "leverage": 10},
+    "BTC/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
+    "ETH/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
+    "SOL/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
+    "BNB/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
+    "XRP/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
 }
 
 def load_state():
-    """Charge la liste des actifs depuis Supabase ou renvoie la liste par défaut."""
+    """Charge la liste des actifs depuis Supabase ou renvoie la liste par défaut en 4h."""
     if not supabase:
         logging.warning("Supabase non connecté. Utilisation de la liste locale par défaut.")
         return DEFAULT_ASSETS.copy()
@@ -56,18 +56,20 @@ def save_state(state):
     """Sauvegarde la liste des actifs dans Supabase."""
     if not supabase:
         logging.error("Impossible de sauvegarder : Supabase non configuré.")
-        return
+        return False
         
     try:
         supabase.table("state").update({"data": state}).eq("id", 1).execute()
+        return True
     except Exception as e:
         logging.error(f"Erreur sauvegarde Supabase : {e}")
+        return False
 
 # Charge l'état global au lancement
 STATE = load_state()
 telegram_app = None
 
-async def fetch_ohlcv(symbol, timeframe="1h", limit=100):
+async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -106,7 +108,7 @@ async def run_scan_job():
         if not config.get("enabled", True):
             continue
         
-        timeframe = config.get("timeframe", "1h")
+        timeframe = config.get("timeframe", "4h")
         leverage = config.get("leverage", 10)
         
         df = await fetch_ohlcv(symbol, timeframe=timeframe)
@@ -135,7 +137,6 @@ async def run_scan_job():
             except Exception as e:
                 logging.error(f"Erreur envoi message Telegram : {e}")
                 
-    # Message de confirmation de fin de scan
     if telegram_app and TELEGRAM_CHAT_ID:
         try:
             await telegram_app.bot.send_message(
@@ -157,51 +158,58 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "📋 **Liste des actifs suivis :**\n\n"
     for symbol, cfg in STATE.items():
         status = "✅" if cfg.get("enabled", True) else "❌"
-        msg += f"{status} **{symbol}** | TF: {cfg.get('timeframe', '1h')} | Lev: {cfg.get('leverage', 10)}x\n"
+        msg += f"{status} **{symbol}** | TF: {cfg.get('timeframe', '4h')} | Lev: {cfg.get('leverage', 10)}x\n"
     
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /add_asset <SYMBOL> [timeframe] [leverage]\nExemple: /add_asset SOL/USDT 1h 10")
+        await update.message.reply_text("Usage: /add_asset <SYMBOL> [timeframe] [leverage]\nExemple: /add_asset SOL/USDT 4h 10")
         return
     
     symbol = args[0].upper()
-    tf = args[1] if len(args) > 1 else "1h"
+    tf = args[1] if len(args) > 1 else "4h"
     lev = int(args[2]) if len(args) > 2 else 10
     
     STATE[symbol] = {"enabled": True, "timeframe": tf, "leverage": lev}
-    save_state(STATE)
+    success = save_state(STATE)
     
-    await update.message.reply_text(f"✅ Actif **{symbol}** ajouté et enregistré !", parse_mode="Markdown")
+    if success:
+        await update.message.reply_text(f"✅ Actif **{symbol}** ({tf}, {lev}x) ajouté et sauvegardé !", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"⚠️ **{symbol}** ajouté localement, mais échec de sauvegarde sur Supabase.", parse_mode="Markdown")
 
 async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /remove_asset <SYMBOL>")
+        await update.message.reply_text("Usage: /remove_asset <SYMBOL>\nExemple: /remove_asset BTC/USDT")
         return
     
     symbol = args[0].upper()
     if symbol in STATE:
         del STATE[symbol]
-        save_state(STATE)
-        await update.message.reply_text(f"🗑️ Actif **{symbol}** supprimé !", parse_mode="Markdown")
+        success = save_state(STATE)
+        if success:
+            await update.message.reply_text(f"🗑️ Actif **{symbol}** supprimé et mis à jour sur Supabase !", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"⚠️ **{symbol}** supprimé localement, mais échec de sauvegarde sur Supabase.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"Actif {symbol} introuvable.")
+        await update.message.reply_text(f"Actif {symbol} introuvable dans la liste.")
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Lancement du scan manuel...")
     asyncio.create_task(run_scan_job())
 
 async def handle_scan_request(request):
+    # Démarrage instantané du scan en tâche de fond
     asyncio.create_task(run_scan_job())
-    return web.Response(text="Scan Job triggered successfully.")
+    # Réponse HTTP immédiate (200 OK) envoyée à Cron-Job.org
+    return web.Response(text="Scan Job triggered successfully.", status=200)
 
 async def main():
     global telegram_app
     
-    # 1. Démarrage du serveur Web (pour Cron-Job)
     server = web.Application()
     server.router.add_get('/scan', handle_scan_request)
     server.router.add_get('/', lambda r: web.Response(text="Signal Bot is Running."))
@@ -211,7 +219,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
 
-    # 2. Initialisation du Bot Telegram
     if TELEGRAM_BOT_TOKEN:
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
