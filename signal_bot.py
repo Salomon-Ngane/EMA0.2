@@ -70,7 +70,13 @@ STATE = load_state()
 telegram_app = None
 
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
-    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
+    # 'enableRateLimit': True respecte le quota de Binance
+    # 'timeout': 5000 évite que le bot ne freeze plus de 5 secondes sur un échec
+    exchange = ccxt.binance({
+        'enableRateLimit': True, 
+        'timeout': 5000,
+        'options': {'defaultType': 'spot'}
+    })
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -81,6 +87,7 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         return None
     finally:
         await exchange.close()
+
 
 def calculate_indicators(df):
     df['ema_20'] = ta.trend.ema_indicator(df['close'], window=20)
@@ -111,31 +118,35 @@ async def run_scan_job():
         timeframe = config.get("timeframe", "4h")
         leverage = config.get("leverage", 10)
         
-        df = await fetch_ohlcv(symbol, timeframe=timeframe)
-        if df is None or df.empty:
-            continue
+        try:
+            df = await fetch_ohlcv(symbol, timeframe=timeframe)
+            # Pause de 500ms entre chaque symbole pour respecter les quotas IP Binance
+            await asyncio.sleep(0.5)
             
-        df = calculate_indicators(df)
-        signal = generate_signal(df)
-        
-        if signal and telegram_app and TELEGRAM_CHAT_ID:
-            curr_price = df.iloc[-1]['close']
-            rsi_val = round(df.iloc[-1]['rsi'], 2)
+            if df is None or df.empty:
+                continue
+                
+            df = calculate_indicators(df)
+            signal = generate_signal(df)
             
-            message = (
-                f"🚨 **SIGNAL DETECTED** 🚨\n\n"
-                f"**Asset:** {symbol}\n"
-                f"**Direction:** {signal}\n"
-                f"**Price:** {curr_price}\n"
-                f"**RSI:** {rsi_val}\n"
-                f"**Timeframe:** {timeframe}\n"
-                f"**Leverage:** {leverage}x"
-            )
-            try:
+            if signal and telegram_app and TELEGRAM_CHAT_ID:
+                curr_price = df.iloc[-1]['close']
+                rsi_val = round(df.iloc[-1]['rsi'], 2)
+                
+                message = (
+                    f"🚨 **SIGNAL DETECTED** 🚨\n\n"
+                    f"**Asset:** {symbol}\n"
+                    f"**Direction:** {signal}\n"
+                    f"**Price:** {curr_price}\n"
+                    f"**RSI:** {rsi_val}\n"
+                    f"**Timeframe:** {timeframe}\n"
+                    f"**Leverage:** {leverage}x"
+                )
                 await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
                 signals_sent += 1
-            except Exception as e:
-                logging.error(f"Erreur envoi message Telegram : {e}")
+        except Exception as e:
+            logging.error(f"Erreur lors du traitement de {symbol}: {e}")
+            continue
                 
     if telegram_app and TELEGRAM_CHAT_ID:
         try:
@@ -145,6 +156,7 @@ async def run_scan_job():
             )
         except Exception as e:
             logging.error(f"Erreur envoi notification fin de scan : {e}")
+
 
 # Commandes Telegram
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
