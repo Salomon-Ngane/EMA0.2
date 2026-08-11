@@ -77,6 +77,31 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         'timeout': 5000,
         'options': {'defaultType': 'spot'}
     })
+    async def fetch_top_movers(limit=5, fetch_gainers=True):
+    """Récupère les plus fortes hausses ou baisses sur 24h sur Binance (Spot USDT)."""
+    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 5000})
+    try:
+        tickers = await exchange.fetch_tickers()
+        usdt_tickers = []
+        
+        for symbol, ticker in tickers.items():
+            # Filtrer uniquement les paires Spot USDT valides avec une variation connue
+            if symbol.endswith('/USDT') and ticker.get('percentage') is not None:
+                usdt_tickers.append({
+                    'symbol': symbol,
+                    'change': ticker['percentage'],
+                    'price': ticker['last']
+                })
+        
+        # Tri : décroissant pour les gainers, croissant pour les losers
+        usdt_tickers.sort(key=lambda x: x['change'], reverse=fetch_gainers)
+        return usdt_tickers[:limit]
+    except Exception as e:
+        logging.error(f"Erreur lors de la récupération des movers 24h : {e}")
+        return []
+    finally:
+        await exchange.close()
+
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -159,6 +184,30 @@ async def run_scan_job():
 
 
 # Commandes Telegram
+async def gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 Récupération du Top Gainers 24h...")
+    movers = await fetch_top_movers(limit=5, fetch_gainers=True)
+    if not movers:
+        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
+        return
+    
+    msg = "🔥 **Top 5 Gainers Binance (24h) :**\n\n"
+    for item in movers:
+        msg += f"🟢 **{item['symbol']}** : +{item['change']:.2f}% | Prix: {item['price']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📉 Récupération du Top Losers 24h...")
+    movers = await fetch_top_movers(limit=5, fetch_gainers=False)
+    if not movers:
+        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
+        return
+    
+    msg = "🔻 **Top 5 Losers Binance (24h) :**\n\n"
+    for item in movers:
+        msg += f"🔴 **{item['symbol']}** : {item['change']:.2f}% | Prix: {item['price']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot EMA Signal opérationnel ! Utilisez /list pour voir les actifs configurés.")
 
@@ -239,6 +288,10 @@ async def main():
         telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
         telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
         telegram_app.add_handler(CommandHandler("scan", scan_cmd))
+        # À ajouter dans main() sous telegram_app.add_handler(...) :
+telegram_app.add_handler(CommandHandler("gainers", gainers_cmd))
+telegram_app.add_handler(CommandHandler("losers", losers_cmd))
+
         
         await telegram_app.initialize()
         await telegram_app.start()
