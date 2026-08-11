@@ -70,38 +70,11 @@ STATE = load_state()
 telegram_app = None
 
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
-    # 'enableRateLimit': True respecte le quota de Binance
-    # 'timeout': 5000 évite que le bot ne freeze plus de 5 secondes sur un échec
     exchange = ccxt.binance({
         'enableRateLimit': True, 
         'timeout': 5000,
         'options': {'defaultType': 'spot'}
     })
-    async def fetch_top_movers(limit=5, fetch_gainers=True):
-    """Récupère les plus fortes hausses ou baisses sur 24h sur Binance (Spot USDT)."""
-    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 5000})
-    try:
-        tickers = await exchange.fetch_tickers()
-        usdt_tickers = []
-        
-        for symbol, ticker in tickers.items():
-            # Filtrer uniquement les paires Spot USDT valides avec une variation connue
-            if symbol.endswith('/USDT') and ticker.get('percentage') is not None:
-                usdt_tickers.append({
-                    'symbol': symbol,
-                    'change': ticker['percentage'],
-                    'price': ticker['last']
-                })
-        
-        # Tri : décroissant pour les gainers, croissant pour les losers
-        usdt_tickers.sort(key=lambda x: x['change'], reverse=fetch_gainers)
-        return usdt_tickers[:limit]
-    except Exception as e:
-        logging.error(f"Erreur lors de la récupération des movers 24h : {e}")
-        return []
-    finally:
-        await exchange.close()
-
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -113,6 +86,28 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     finally:
         await exchange.close()
 
+async def fetch_top_movers(limit=5, fetch_gainers=True):
+    """Récupère les plus fortes hausses ou baisses sur 24h sur Binance (Spot USDT)."""
+    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 5000})
+    try:
+        tickers = await exchange.fetch_tickers()
+        usdt_tickers = []
+        
+        for symbol, ticker in tickers.items():
+            if symbol.endswith('/USDT') and ticker.get('percentage') is not None:
+                usdt_tickers.append({
+                    'symbol': symbol,
+                    'change': ticker['percentage'],
+                    'price': ticker['last']
+                })
+        
+        usdt_tickers.sort(key=lambda x: x['change'], reverse=fetch_gainers)
+        return usdt_tickers[:limit]
+    except Exception as e:
+        logging.error(f"Erreur lors de la récupération des movers 24h : {e}")
+        return []
+    finally:
+        await exchange.close()
 
 def calculate_indicators(df):
     df['ema_20'] = ta.trend.ema_indicator(df['close'], window=20)
@@ -145,8 +140,7 @@ async def run_scan_job():
         
         try:
             df = await fetch_ohlcv(symbol, timeframe=timeframe)
-            # Pause de 500ms entre chaque symbole pour respecter les quotas IP Binance
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5) # Pause pour respecter l'API Binance
             
             if df is None or df.empty:
                 continue
@@ -182,32 +176,7 @@ async def run_scan_job():
         except Exception as e:
             logging.error(f"Erreur envoi notification fin de scan : {e}")
 
-
 # Commandes Telegram
-async def gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Récupération du Top Gainers 24h...")
-    movers = await fetch_top_movers(limit=5, fetch_gainers=True)
-    if not movers:
-        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
-        return
-    
-    msg = "🔥 **Top 5 Gainers Binance (24h) :**\n\n"
-    for item in movers:
-        msg += f"🟢 **{item['symbol']}** : +{item['change']:.2f}% | Prix: {item['price']}\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📉 Récupération du Top Losers 24h...")
-    movers = await fetch_top_movers(limit=5, fetch_gainers=False)
-    if not movers:
-        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
-        return
-    
-    msg = "🔻 **Top 5 Losers Binance (24h) :**\n\n"
-    for item in movers:
-        msg += f"🔴 **{item['symbol']}** : {item['change']:.2f}% | Prix: {item['price']}\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot EMA Signal opérationnel ! Utilisez /list pour voir les actifs configurés.")
 
@@ -262,18 +231,44 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Lancement du scan manuel...")
     asyncio.create_task(run_scan_job())
 
+async def gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 Récupération du Top Gainers 24h...")
+    movers = await fetch_top_movers(limit=5, fetch_gainers=True)
+    if not movers:
+        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
+        return
+    
+    msg = "🔥 **Top 5 Gainers Binance (24h) :**\n\n"
+    for item in movers:
+        msg += f"🟢 **{item['symbol']}** : +{item['change']:.2f}% | Prix: {item['price']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📉 Récupération du Top Losers 24h...")
+    movers = await fetch_top_movers(limit=5, fetch_gainers=False)
+    if not movers:
+        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
+        return
+    
+    msg = "🔻 **Top 5 Losers Binance (24h) :**\n\n"
+    for item in movers:
+        msg += f"🔴 **{item['symbol']}** : {item['change']:.2f}% | Prix: {item['price']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 async def handle_scan_request(request):
-    # Démarrage instantané du scan en tâche de fond
     asyncio.create_task(run_scan_job())
-    # Réponse HTTP immédiate (200 OK) envoyée à Cron-Job.org
     return web.Response(text="Scan Job triggered successfully.", status=200)
+
+async def handle_ping_request(request):
+    return web.Response(text="PONG", status=200)
 
 async def main():
     global telegram_app
     
     server = web.Application()
     server.router.add_get('/scan', handle_scan_request)
-    server.router.add_get('/', lambda r: web.Response(text="Signal Bot is Running."))
+    server.router.add_get('/ping', handle_ping_request)
+    server.router.add_get('/', lambda r: web.Response(text="Signal Bot is Running.", status=200))
     
     runner = web.AppRunner(server)
     await runner.setup()
@@ -288,14 +283,22 @@ async def main():
         telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
         telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
         telegram_app.add_handler(CommandHandler("scan", scan_cmd))
-        # À ajouter dans main() sous telegram_app.add_handler(...) :
-telegram_app.add_handler(CommandHandler("gainers", gainers_cmd))
-telegram_app.add_handler(CommandHandler("losers", losers_cmd))
-
+        telegram_app.add_handler(CommandHandler("gainers", gainers_cmd))
+        telegram_app.add_handler(CommandHandler("losers", losers_cmd))
         
         await telegram_app.initialize()
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
+        
+        if TELEGRAM_CHAT_ID:
+            try:
+                await telegram_app.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID, 
+                    text="⚡ **Bot mis à jour et prêt !**\nCommandes disponibles : /scan, /gainers, /losers, /list", 
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logging.error(f"Erreur envoi notification de lancement : {e}")
     
     await asyncio.Event().wait()
 
