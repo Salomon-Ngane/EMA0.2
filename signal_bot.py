@@ -75,9 +75,15 @@ STATE = load_state()
 telegram_app = None
 
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
+    # Validation du timeframe pour éviter l'erreur 'Invalid interval'
+    valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
+    if not timeframe or timeframe not in valid_timeframes:
+        timeframe = "4h"
+
     exchange = ccxt.binance({
         'enableRateLimit': True, 
-        'timeout': 5000,
+        'rateLimit': 2000, # Délai augmenté pour éviter le bannissement IP
+        'timeout': 10000,
         'options': {'defaultType': 'spot'}
     })
     try:
@@ -92,7 +98,11 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         await exchange.close()
 
 async def fetch_top_movers(limit=5, fetch_gainers=True):
-    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 5000})
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'rateLimit': 2000,
+        'timeout': 10000
+    })
     try:
         tickers = await exchange.fetch_tickers()
         usdt_tickers = []
@@ -125,7 +135,6 @@ def generate_signal(df):
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # Analyse du filtre EMA Cross
     if prev['ema_20'] <= prev['ema_50'] and curr['ema_20'] > curr['ema_50']:
         return "BUY", f"Croisement Haussier (EMA20={curr['ema_20']:.2f} > EMA50={curr['ema_50']:.2f})"
     elif prev['ema_20'] >= prev['ema_50'] and curr['ema_20'] < curr['ema_50']:
@@ -137,7 +146,6 @@ async def run_scan_job():
     global LAST_SCAN_LOGS
     logging.info("Lancement du scan des marchés...")
     
-    # Réinitialisation des logs en mémoire pour ce scan
     LAST_SCAN_LOGS = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "details": [],
@@ -155,7 +163,7 @@ async def run_scan_job():
         
         try:
             df = await fetch_ohlcv(symbol, timeframe=timeframe)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(2.0) # Pause de 2s entre chaque actif pour respecter l'IP
             
             if df is None or df.empty:
                 LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}**: Erreur de données OHLCV")
@@ -167,7 +175,6 @@ async def run_scan_job():
             curr_price = df.iloc[-1]['close']
             rsi_val = round(df.iloc[-1]['rsi'], 2)
             
-            # Enregistrement du log de filtre
             log_line = f"**{symbol}** ({timeframe}): Prix={curr_price} | RSI={rsi_val} | Filter: {filter_reason}"
             LAST_SCAN_LOGS["details"].append(log_line)
             
@@ -205,7 +212,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot EMA Signal opérationnel ! Utilisez /list pour voir les actifs configurés.")
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche les détails et filtres appliqués lors du dernier scan exécuté."""
     if not LAST_SCAN_LOGS["timestamp"]:
         await update.message.reply_text("Aucun scan n'a encore été exécuté depuis le dernier démarrage.")
         return
@@ -223,7 +229,6 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for detail in LAST_SCAN_LOGS["details"]:
         msg += f"• {detail}\n"
         
-    # Découpage du message si celui-ci dépasse la limite de Telegram (4096 caractères)
     if len(msg) > 4000:
         for i in range(0, len(msg), 4000):
             await update.message.reply_text(msg[i:i+4000], parse_mode="Markdown")
@@ -341,15 +346,14 @@ async def main():
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         
-        # Lancement immédiat du scan automatique au démarrage
-        logging.info("Lancement du scan initial au démarrage...")
+        logging.info("Démarrage du scan initial...")
         asyncio.create_task(run_scan_job())
         
         if TELEGRAM_CHAT_ID:
             try:
                 await telegram_app.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
-                    text="⚡ **Bot mis à jour ! Scan initial lancé.**\nCommandes : /logs, /scan, /list, /gainers, /losers", 
+                    text="⚡ **Bot mis à jour ! Scan automatique lancé.**\nCommandes : /logs, /scan, /list", 
                     parse_mode="Markdown"
                 )
             except Exception as e:
@@ -359,4 +363,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
