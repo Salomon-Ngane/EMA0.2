@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from datetime import datetime
 from aiohttp import web
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -28,7 +29,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         logging.error(f"Erreur d'initialisation Supabase : {e}")
 
-# Default Assets Configuration (Timeframe par défaut : 4h)
+# Default Assets Configuration
 DEFAULT_ASSETS = {
     "BTC/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
     "ETH/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
@@ -37,8 +38,14 @@ DEFAULT_ASSETS = {
     "XRP/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
 }
 
+# Mémoire globale pour stocker les logs du dernier scan
+LAST_SCAN_LOGS = {
+    "timestamp": None,
+    "details": [],
+    "signals": []
+}
+
 def load_state():
-    """Charge la liste des actifs depuis Supabase ou renvoie la liste par défaut en 4h."""
     if not supabase:
         logging.warning("Supabase non connecté. Utilisation de la liste locale par défaut.")
         return DEFAULT_ASSETS.copy()
@@ -53,7 +60,6 @@ def load_state():
     return DEFAULT_ASSETS.copy()
 
 def save_state(state):
-    """Sauvegarde la liste des actifs dans Supabase."""
     if not supabase:
         logging.error("Impossible de sauvegarder : Supabase non configuré.")
         return False
@@ -65,7 +71,6 @@ def save_state(state):
         logging.error(f"Erreur sauvegarde Supabase : {e}")
         return False
 
-# Charge l'état global au lancement
 STATE = load_state()
 telegram_app = None
 
@@ -87,7 +92,6 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         await exchange.close()
 
 async def fetch_top_movers(limit=5, fetch_gainers=True):
-    """Récupère les plus fortes hausses ou baisses sur 24h sur Binance (Spot USDT)."""
     exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 5000})
     try:
         tickers = await exchange.fetch_tickers()
@@ -117,22 +121,33 @@ def calculate_indicators(df):
 
 def generate_signal(df):
     if len(df) < 2:
-        return None
+        return None, "Données insuffisantes"
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
+    # Analyse du filtre EMA Cross
     if prev['ema_20'] <= prev['ema_50'] and curr['ema_20'] > curr['ema_50']:
-        return "BUY"
+        return "BUY", f"Croisement Haussier (EMA20={curr['ema_20']:.2f} > EMA50={curr['ema_50']:.2f})"
     elif prev['ema_20'] >= prev['ema_50'] and curr['ema_20'] < curr['ema_50']:
-        return "SELL"
-    return None
+        return "SELL", f"Croisement Baissier (EMA20={curr['ema_20']:.2f} < EMA50={curr['ema_50']:.2f})"
+    
+    return None, f"Pas de croisement (EMA20={curr['ema_20']:.2f}, EMA50={curr['ema_50']:.2f})"
 
 async def run_scan_job():
+    global LAST_SCAN_LOGS
     logging.info("Lancement du scan des marchés...")
+    
+    # Réinitialisation des logs en mémoire pour ce scan
+    LAST_SCAN_LOGS = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "details": [],
+        "signals": []
+    }
     signals_sent = 0
     
     for symbol, config in list(STATE.items()):
         if not config.get("enabled", True):
+            LAST_SCAN_LOGS["details"].append(f"⚪ **{symbol}**: Désactivé")
             continue
         
         timeframe = config.get("timeframe", "4h")
@@ -140,38 +155,47 @@ async def run_scan_job():
         
         try:
             df = await fetch_ohlcv(symbol, timeframe=timeframe)
-            await asyncio.sleep(0.5) # Pause pour respecter l'API Binance
+            await asyncio.sleep(0.5)
             
             if df is None or df.empty:
+                LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}**: Erreur de données OHLCV")
                 continue
                 
             df = calculate_indicators(df)
-            signal = generate_signal(df)
+            signal, filter_reason = generate_signal(df)
             
-            if signal and telegram_app and TELEGRAM_CHAT_ID:
-                curr_price = df.iloc[-1]['close']
-                rsi_val = round(df.iloc[-1]['rsi'], 2)
+            curr_price = df.iloc[-1]['close']
+            rsi_val = round(df.iloc[-1]['rsi'], 2)
+            
+            # Enregistrement du log de filtre
+            log_line = f"**{symbol}** ({timeframe}): Prix={curr_price} | RSI={rsi_val} | Filter: {filter_reason}"
+            LAST_SCAN_LOGS["details"].append(log_line)
+            
+            if signal:
+                LAST_SCAN_LOGS["signals"].append(f"🚨 **{signal}** sur **{symbol}** à {curr_price} (RSI: {rsi_val})")
                 
-                message = (
-                    f"🚨 **SIGNAL DETECTED** 🚨\n\n"
-                    f"**Asset:** {symbol}\n"
-                    f"**Direction:** {signal}\n"
-                    f"**Price:** {curr_price}\n"
-                    f"**RSI:** {rsi_val}\n"
-                    f"**Timeframe:** {timeframe}\n"
-                    f"**Leverage:** {leverage}x"
-                )
-                await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-                signals_sent += 1
+                if telegram_app and TELEGRAM_CHAT_ID:
+                    message = (
+                        f"🚨 **SIGNAL DETECTED** 🚨\n\n"
+                        f"**Asset:** {symbol}\n"
+                        f"**Direction:** {signal}\n"
+                        f"**Price:** {curr_price}\n"
+                        f"**RSI:** {rsi_val}\n"
+                        f"**Timeframe:** {timeframe}\n"
+                        f"**Leverage:** {leverage}x"
+                    )
+                    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+                    signals_sent += 1
         except Exception as e:
             logging.error(f"Erreur lors du traitement de {symbol}: {e}")
+            LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}**: Exception {e}")
             continue
                 
     if telegram_app and TELEGRAM_CHAT_ID:
         try:
             await telegram_app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID, 
-                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Le bot reste opérationnel."
+                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Utilisez /logs pour voir l'analyse détaillée."
             )
         except Exception as e:
             logging.error(f"Erreur envoi notification fin de scan : {e}")
@@ -179,6 +203,32 @@ async def run_scan_job():
 # Commandes Telegram
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot EMA Signal opérationnel ! Utilisez /list pour voir les actifs configurés.")
+
+async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche les détails et filtres appliqués lors du dernier scan exécuté."""
+    if not LAST_SCAN_LOGS["timestamp"]:
+        await update.message.reply_text("Aucun scan n'a encore été exécuté depuis le dernier démarrage.")
+        return
+
+    msg = f"📊 **Rapport du Dernier Scan ({LAST_SCAN_LOGS['timestamp']})**\n\n"
+    
+    msg += "🚨 **Signaux Détectés :**\n"
+    if LAST_SCAN_LOGS["signals"]:
+        for sig in LAST_SCAN_LOGS["signals"]:
+            msg += f"{sig}\n"
+    else:
+        msg += "Aucun signal détecté.\n"
+        
+    msg += "\n🔎 **Détail des Filtres Appliqués :**\n"
+    for detail in LAST_SCAN_LOGS["details"]:
+        msg += f"• {detail}\n"
+        
+    # Découpage du message si celui-ci dépasse la limite de Telegram (4096 caractères)
+    if len(msg) > 4000:
+        for i in range(0, len(msg), 4000):
+            await update.message.reply_text(msg[i:i+4000], parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not STATE:
@@ -279,6 +329,7 @@ async def main():
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         
         telegram_app.add_handler(CommandHandler("start", start_cmd))
+        telegram_app.add_handler(CommandHandler("logs", logs_cmd))
         telegram_app.add_handler(CommandHandler("list", list_cmd))
         telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
         telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
@@ -290,11 +341,15 @@ async def main():
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         
+        # Lancement immédiat du scan automatique au démarrage
+        logging.info("Lancement du scan initial au démarrage...")
+        asyncio.create_task(run_scan_job())
+        
         if TELEGRAM_CHAT_ID:
             try:
                 await telegram_app.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
-                    text="⚡ **Bot mis à jour et prêt !**\nCommandes disponibles : /scan, /gainers, /losers, /list", 
+                    text="⚡ **Bot mis à jour ! Scan initial lancé.**\nCommandes : /logs, /scan, /list, /gainers, /losers", 
                     parse_mode="Markdown"
                 )
             except Exception as e:
@@ -304,3 +359,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
