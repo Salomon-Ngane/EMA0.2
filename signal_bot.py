@@ -29,7 +29,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         logging.error(f"Erreur d'initialisation Supabase : {e}")
 
-# Default Assets Configuration
+# Default Assets Configuration (Timeframe par défaut : 4h)
 DEFAULT_ASSETS = {
     "BTC/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
     "ETH/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
@@ -46,6 +46,7 @@ LAST_SCAN_LOGS = {
 }
 
 def load_state():
+    """Charge la liste des actifs depuis Supabase ou renvoie la liste par défaut en 4h."""
     if not supabase:
         logging.warning("Supabase non connecté. Utilisation de la liste locale par défaut.")
         return DEFAULT_ASSETS.copy()
@@ -60,6 +61,7 @@ def load_state():
     return DEFAULT_ASSETS.copy()
 
 def save_state(state):
+    """Sauvegarde la liste des actifs dans Supabase."""
     if not supabase:
         logging.error("Impossible de sauvegarder : Supabase non configuré.")
         return False
@@ -71,18 +73,18 @@ def save_state(state):
         logging.error(f"Erreur sauvegarde Supabase : {e}")
         return False
 
+# Charge l'état global au lancement
 STATE = load_state()
 telegram_app = None
 
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
-    # Validation du timeframe pour éviter l'erreur 'Invalid interval'
     valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
     if not timeframe or timeframe not in valid_timeframes:
         timeframe = "4h"
 
     exchange = ccxt.binance({
         'enableRateLimit': True, 
-        'rateLimit': 2000, # Délai augmenté pour éviter le bannissement IP
+        'rateLimit': 2000,
         'timeout': 10000,
         'options': {'defaultType': 'spot'}
     })
@@ -98,6 +100,7 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         await exchange.close()
 
 async def fetch_top_movers(limit=5, fetch_gainers=True):
+    """Récupère les plus fortes hausses ou baisses sur 24h sur Binance (Spot USDT)."""
     exchange = ccxt.binance({
         'enableRateLimit': True,
         'rateLimit': 2000,
@@ -124,23 +127,83 @@ async def fetch_top_movers(limit=5, fetch_gainers=True):
         await exchange.close()
 
 def calculate_indicators(df):
-    df['ema_20'] = ta.trend.ema_indicator(df['close'], window=20)
-    df['ema_50'] = ta.trend.ema_indicator(df['close'], window=50)
-    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+    """Calcul des nouvelles moyennes mobiles EMA 10, EMA 35 et EMA 55."""
+    df['ema_10'] = ta.trend.ema_indicator(df['close'], window=10)
+    df['ema_35'] = ta.trend.ema_indicator(df['close'], window=35)
+    df['ema_55'] = ta.trend.ema_indicator(df['close'], window=55)
     return df
 
-def generate_signal(df):
-    if len(df) < 2:
-        return None, "Données insuffisantes"
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+def generate_signal_and_calc_rr(df):
+    """
+    Détecte les signaux de Cassure ou Retest (fenêtre de 5 bougies)
+    et applique le filtre Risk/Reward >= 2.7 basé sur les Pivots (SL: 10, TP: 60).
+    """
+    if len(df) < 65:
+        return None, "Données insuffisantes (< 65 bougies)", None, None, None
 
-    if prev['ema_20'] <= prev['ema_50'] and curr['ema_20'] > curr['ema_50']:
-        return "BUY", f"Croisement Haussier (EMA20={curr['ema_20']:.2f} > EMA50={curr['ema_50']:.2f})"
-    elif prev['ema_20'] >= prev['ema_50'] and curr['ema_20'] < curr['ema_50']:
-        return "SELL", f"Croisement Baissier (EMA20={curr['ema_20']:.2f} < EMA50={curr['ema_50']:.2f})"
+    curr = df.iloc[-1]
+    curr_price = curr['close']
     
-    return None, f"Pas de croisement (EMA20={curr['ema_20']:.2f}, EMA50={curr['ema_50']:.2f})"
+    signal_type = None
+    setup_direction = None
+
+    # 1. Détection de Cassure directe sur la dernière bougie
+    prev = df.iloc[-2]
+    if prev['ema_10'] <= prev['ema_55'] and curr['ema_10'] > curr['ema_55']:
+        signal_type = "Cassure"
+        setup_direction = "BUY"
+    elif prev['ema_10'] >= prev['ema_55'] and curr['ema_10'] < curr['ema_55']:
+        signal_type = "Cassure"
+        setup_direction = "SELL"
+
+    # 2. Détection de Retest dans la fenêtre des 5 dernières bougies si pas de cassure directe
+    if not setup_direction:
+        window = df.iloc[-6:-1] # 5 bougies précédentes
+        
+        # Condition Retest BUY : EMA 10 > EMA 55 globale, mais pullback du prix/EMA10 touche EMA 35 ou EMA 55
+        has_bull_cross = any(window['ema_10'] > window['ema_55'])
+        retest_bull = any((window['low'] <= window['ema_35']) | (window['low'] <= window['ema_55']))
+        if has_bull_cross and retest_bull and curr['ema_10'] > curr['ema_35'] and curr['close'] > curr['ema_10']:
+            signal_type = "Retest"
+            setup_direction = "BUY"
+
+        # Condition Retest SELL : EMA 10 < EMA 55 globale, mais pullback du prix/EMA10 touche EMA 35 ou EMA 55
+        has_bear_cross = any(window['ema_10'] < window['ema_55'])
+        retest_bear = any((window['high'] >= window['ema_35']) | (window['high'] >= window['ema_55']))
+        if has_bear_cross and retest_bear and curr['ema_10'] < curr['ema_35'] and curr['close'] < curr['ema_10']:
+            signal_type = "Retest"
+            setup_direction = "SELL"
+
+    if not setup_direction:
+        return None, "Pas de signal (Pas de cassure ni retest valide)", None, None, None
+
+    # 3. Calcul dynamique du SL (Pivots 10 bougies) et TP (Pivots 60 bougies)
+    lookback_sl = df.iloc[-10:]
+    lookback_tp = df.iloc[-60:]
+
+    if setup_direction == "BUY":
+        sl = lookback_sl['low'].min()
+        tp = lookback_tp['high'].max()
+        risk = curr_price - sl
+        reward = tp - curr_price
+    else: # SELL
+        sl = lookback_sl['high'].max()
+        tp = lookback_tp['low'].min()
+        risk = sl - curr_price
+        reward = curr_price - tp
+
+    if risk <= 0 or reward <= 0:
+        return None, f"Configuration invalide ({setup_direction}): Risk ou Reward négatif", sl, tp, 0
+
+    rr_ratio = round(reward / risk, 2)
+
+    # 4. Filtre strict Risk/Reward >= 2.7
+    if rr_ratio < 2.7:
+        reason = f"Signal {setup_direction} ({signal_type}) REJETÉ: R:R = {rr_ratio} < 2.7 (SL: {sl:.4f}, TP: {tp:.4f})"
+        return None, reason, sl, tp, rr_ratio
+
+    valid_reason = f"Signal {setup_direction} ({signal_type}) VALIDE: R:R = {rr_ratio} >= 2.7"
+    return setup_direction, valid_reason, sl, tp, rr_ratio
 
 async def run_scan_job():
     global LAST_SCAN_LOGS
@@ -163,23 +226,24 @@ async def run_scan_job():
         
         try:
             df = await fetch_ohlcv(symbol, timeframe=timeframe)
-            await asyncio.sleep(2.0) # Pause de 2s entre chaque actif pour respecter l'IP
+            await asyncio.sleep(2.0)
             
             if df is None or df.empty:
                 LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}**: Erreur de données OHLCV")
                 continue
                 
             df = calculate_indicators(df)
-            signal, filter_reason = generate_signal(df)
+            signal, filter_reason, sl, tp, rr = generate_signal_and_calc_rr(df)
             
             curr_price = df.iloc[-1]['close']
-            rsi_val = round(df.iloc[-1]['rsi'], 2)
             
-            log_line = f"**{symbol}** ({timeframe}): Prix={curr_price} | RSI={rsi_val} | Filter: {filter_reason}"
+            log_line = f"**{symbol}** ({timeframe}): Prix={curr_price} | Filter: {filter_reason}"
             LAST_SCAN_LOGS["details"].append(log_line)
             
             if signal:
-                LAST_SCAN_LOGS["signals"].append(f"🚨 **{signal}** sur **{symbol}** à {curr_price} (RSI: {rsi_val})")
+                LAST_SCAN_LOGS["signals"].append(
+                    f"🚨 **{signal}** sur **{symbol}** à {curr_price} (SL: {sl:.4f}, TP: {tp:.4f}, R:R: {rr})"
+                )
                 
                 if telegram_app and TELEGRAM_CHAT_ID:
                     message = (
@@ -187,7 +251,9 @@ async def run_scan_job():
                         f"**Asset:** {symbol}\n"
                         f"**Direction:** {signal}\n"
                         f"**Price:** {curr_price}\n"
-                        f"**RSI:** {rsi_val}\n"
+                        f"**Stop-Loss:** {sl:.4f}\n"
+                        f"**Take-Profit:** {tp:.4f}\n"
+                        f"**Risk/Reward:** {rr}\n"
                         f"**Timeframe:** {timeframe}\n"
                         f"**Leverage:** {leverage}x"
                     )
@@ -202,14 +268,14 @@ async def run_scan_job():
         try:
             await telegram_app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID, 
-                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Utilisez /logs pour voir l'analyse détaillée."
+                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Utilisez /logs pour le détail."
             )
         except Exception as e:
             logging.error(f"Erreur envoi notification fin de scan : {e}")
 
 # Commandes Telegram
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot EMA Signal opérationnel ! Utilisez /list pour voir les actifs configurés.")
+    await update.message.reply_text("Bot EMA Strategy (10/35/55 + R:R 2.7) opérationnel ! Utilisez /list pour voir vos actifs.")
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not LAST_SCAN_LOGS["timestamp"]:
@@ -218,12 +284,12 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = f"📊 **Rapport du Dernier Scan ({LAST_SCAN_LOGS['timestamp']})**\n\n"
     
-    msg += "🚨 **Signaux Détectés :**\n"
+    msg += "🚨 **Signaux Valides Détectés :**\n"
     if LAST_SCAN_LOGS["signals"]:
         for sig in LAST_SCAN_LOGS["signals"]:
             msg += f"{sig}\n"
     else:
-        msg += "Aucun signal détecté.\n"
+        msg += "Aucun signal validé.\n"
         
     msg += "\n🔎 **Détail des Filtres Appliqués :**\n"
     for detail in LAST_SCAN_LOGS["details"]:
@@ -353,7 +419,7 @@ async def main():
             try:
                 await telegram_app.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
-                    text="⚡ **Bot mis à jour ! Scan automatique lancé.**\nCommandes : /logs, /scan, /list", 
+                    text="⚡ **Bot mis à jour avec la stratégie EMA 10/35/55 + R:R >= 2.7 !**\nCommandes : /logs, /scan, /list, /gainers, /losers", 
                     parse_mode="Markdown"
                 )
             except Exception as e:
@@ -363,3 +429,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
