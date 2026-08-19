@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiohttp import web
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -29,7 +29,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         logging.error(f"Erreur d'initialisation Supabase : {e}")
 
-# Default Assets Configuration (Timeframe par défaut : 4h)
+# Default Assets Configuration
 DEFAULT_ASSETS = {
     "BTC/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
     "ETH/USDT": {"enabled": True, "timeframe": "4h", "leverage": 10},
@@ -46,7 +46,6 @@ LAST_SCAN_LOGS = {
 }
 
 def load_state():
-    """Charge la liste des actifs depuis Supabase ou renvoie la liste par défaut en 4h."""
     if not supabase:
         logging.warning("Supabase non connecté. Utilisation de la liste locale par défaut.")
         return DEFAULT_ASSETS.copy()
@@ -61,7 +60,6 @@ def load_state():
     return DEFAULT_ASSETS.copy()
 
 def save_state(state):
-    """Sauvegarde la liste des actifs dans Supabase."""
     if not supabase:
         logging.error("Impossible de sauvegarder : Supabase non configuré.")
         return False
@@ -73,7 +71,6 @@ def save_state(state):
         logging.error(f"Erreur sauvegarde Supabase : {e}")
         return False
 
-# Charge l'état global au lancement
 STATE = load_state()
 telegram_app = None
 
@@ -100,7 +97,6 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         await exchange.close()
 
 async def fetch_top_movers(limit=5, fetch_gainers=True):
-    """Récupère les plus fortes hausses ou baisses sur 24h sur Binance (Spot USDT)."""
     exchange = ccxt.binance({
         'enableRateLimit': True,
         'rateLimit': 2000,
@@ -127,57 +123,78 @@ async def fetch_top_movers(limit=5, fetch_gainers=True):
         await exchange.close()
 
 def calculate_indicators(df):
-    """Calcul des nouvelles moyennes mobiles EMA 10, EMA 35 et EMA 55."""
+    """Calcul EMA 10, MA 35 (Lissée / RMA) et EMA 55."""
     df['ema_10'] = ta.trend.ema_indicator(df['close'], window=10)
-    df['ema_35'] = ta.trend.ema_indicator(df['close'], window=35)
+    # Calcul RMA (Running Moving Average) identique à ta.rma(close, 35) de TradingView
+    df['ma_35'] = df['close'].ewm(alpha=1/35, adjust=False).mean()
     df['ema_55'] = ta.trend.ema_indicator(df['close'], window=55)
     return df
 
 def generate_signal_and_calc_rr(df):
     """
-    Détecte les signaux de Cassure ou Retest (fenêtre de 5 bougies)
-    et applique le filtre Risk/Reward >= 2.7 basé sur les Pivots (SL: 10, TP: 60).
+    Stratégie alignée sur Pine Script avec vos ajustements :
+    - EMA 10 > MA 35 ET EMA 10 > EMA 55 (Cassure)
+    - Retest EMA 10 sur fenêtre de 20 bougies
+    - Filtre de Tendance MA 35 (close > ma_35)
+    - TP/SL selon l'esquisse TradingView (Pivots SL: 10, TP: 60)
+    - Filtre R:R >= 2.7
     """
     if len(df) < 65:
         return None, "Données insuffisantes (< 65 bougies)", None, None, None
 
     curr = df.iloc[-1]
+    prev = df.iloc[-2]
     curr_price = curr['close']
     
     signal_type = None
     setup_direction = None
 
-    # 1. Détection de Cassure directe sur la dernière bougie
-    prev = df.iloc[-2]
-    if prev['ema_10'] <= prev['ema_55'] and curr['ema_10'] > curr['ema_55']:
+    # Conditions de sortie globale EMA 10
+    ema_above_both_curr = (curr['ema_10'] > curr['ma_35']) and (curr['ema_10'] > curr['ema_55'])
+    ema_above_both_prev = (prev['ema_10'] > prev['ma_35']) and (prev['ema_10'] > prev['ema_55'])
+    
+    ema_below_both_curr = (curr['ema_10'] < curr['ma_35']) and (curr['ema_10'] < curr['ema_55'])
+    ema_below_both_prev = (prev['ema_10'] < prev['ma_35']) and (prev['ema_10'] < prev['ema_55'])
+
+    # 1. Détection Cassure
+    breakout_up = ema_above_both_curr and not ema_above_both_prev
+    breakout_down = ema_below_both_curr and not ema_below_both_prev
+
+    if breakout_up:
         signal_type = "Cassure"
         setup_direction = "BUY"
-    elif prev['ema_10'] >= prev['ema_55'] and curr['ema_10'] < curr['ema_55']:
+    elif breakout_down:
         signal_type = "Cassure"
         setup_direction = "SELL"
 
-    # 2. Détection de Retest dans la fenêtre des 5 dernières bougies si pas de cassure directe
+    # 2. Détection Retest (Fenêtre max 20 bougies)
     if not setup_direction:
-        window = df.iloc[-6:-1] # 5 bougies précédentes
+        window = df.iloc[-21:-1] # 20 bougies précédentes
         
-        # Condition Retest BUY : EMA 10 > EMA 55 globale, mais pullback du prix/EMA10 touche EMA 35 ou EMA 55
-        has_bull_cross = any(window['ema_10'] > window['ema_55'])
-        retest_bull = any((window['low'] <= window['ema_35']) | (window['low'] <= window['ema_55']))
-        if has_bull_cross and retest_bull and curr['ema_10'] > curr['ema_35'] and curr['close'] > curr['ema_10']:
+        # Test si une cassure a eu lieu dans les 20 dernières bougies
+        had_breakout_up = any((window['ema_10'] > window['ma_35']) & (window['ema_10'] > window['ema_55']))
+        had_breakout_down = any((window['ema_10'] < window['ma_35']) & (window['ema_10'] < window['ema_55']))
+
+        retest_long = had_breakout_up and (curr['low'] <= curr['ema_10']) and (curr['close'] > curr['ema_10'])
+        retest_short = had_breakout_down and (curr['high'] >= curr['ema_10']) and (curr['close'] < curr['ema_10'])
+
+        if retest_long:
             signal_type = "Retest"
             setup_direction = "BUY"
-
-        # Condition Retest SELL : EMA 10 < EMA 55 globale, mais pullback du prix/EMA10 touche EMA 35 ou EMA 55
-        has_bear_cross = any(window['ema_10'] < window['ema_55'])
-        retest_bear = any((window['high'] >= window['ema_35']) | (window['high'] >= window['ema_55']))
-        if has_bear_cross and retest_bear and curr['ema_10'] < curr['ema_35'] and curr['close'] < curr['ema_10']:
+        elif retest_short:
             signal_type = "Retest"
             setup_direction = "SELL"
 
     if not setup_direction:
-        return None, "Pas de signal (Pas de cassure ni retest valide)", None, None, None
+        return None, "Pas de signal (Ni cassure ni retest valide)", None, None, None
 
-    # 3. Calcul dynamique du SL (Pivots 10 bougies) et TP (Pivots 60 bougies)
+    # 3. Filtre de Tendance MA 35
+    if setup_direction == "BUY" and curr['close'] <= curr['ma_35']:
+        return None, "REJETÉ: Prix sous la MA 35 (Tendance Baissière)", None, None, None
+    if setup_direction == "SELL" and curr['close'] >= curr['ma_35']:
+        return None, "REJETÉ: Prix au-dessus de la MA 35 (Tendance Haussière)", None, None, None
+
+    # 4. Calcul TP / SL d'après la règle (SL: 10 bougies, TP: 60 bougies)
     lookback_sl = df.iloc[-10:]
     lookback_tp = df.iloc[-60:]
 
@@ -193,11 +210,11 @@ def generate_signal_and_calc_rr(df):
         reward = curr_price - tp
 
     if risk <= 0 or reward <= 0:
-        return None, f"Configuration invalide ({setup_direction}): Risk ou Reward négatif", sl, tp, 0
+        return None, f"Configuration invalide ({setup_direction}): SL/TP incohérent", sl, tp, 0
 
     rr_ratio = round(reward / risk, 2)
 
-    # 4. Filtre strict Risk/Reward >= 2.7
+    # 5. Filtre Risk/Reward min 2.7
     if rr_ratio < 2.7:
         reason = f"Signal {setup_direction} ({signal_type}) REJETÉ: R:R = {rr_ratio} < 2.7 (SL: {sl:.4f}, TP: {tp:.4f})"
         return None, reason, sl, tp, rr_ratio
@@ -236,7 +253,6 @@ async def run_scan_job():
             signal, filter_reason, sl, tp, rr = generate_signal_and_calc_rr(df)
             
             curr_price = df.iloc[-1]['close']
-            
             log_line = f"**{symbol}** ({timeframe}): Prix={curr_price} | Filter: {filter_reason}"
             LAST_SCAN_LOGS["details"].append(log_line)
             
@@ -268,18 +284,38 @@ async def run_scan_job():
         try:
             await telegram_app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID, 
-                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Utilisez /logs pour le détail."
+                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Tapez /logs pour les détails."
             )
         except Exception as e:
             logging.error(f"Erreur envoi notification fin de scan : {e}")
 
+async def scheduled_cron_loop():
+    """
+    Planificateur interne : Exécute le scan précisément aux heures fixes
+    (00h, 04h, 08h, 12h, 16h, 20h UTC) sans décalage en cas de scan manuel.
+    """
+    while True:
+        now = datetime.utcnow()
+        # Calcul du prochain créneau de 4 heures fixe (0, 4, 8, 12, 16, 20)
+        next_hour = ((now.hour // 4) + 1) * 4
+        if next_hour >= 24:
+            next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_run = now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+            
+        wait_seconds = (next_run - now).total_seconds()
+        logging.info(f"Prochain scan automatique programmé pour : {next_run.strftime('%Y-%m-%d %H:%M:%S UTC')} (attente de {int(wait_seconds)}s)")
+        
+        await asyncio.sleep(wait_seconds)
+        await run_scan_job()
+
 # Commandes Telegram
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot EMA Strategy (10/35/55 + R:R 2.7) opérationnel ! Utilisez /list pour voir vos actifs.")
+    await update.message.reply_text("Bot EMA Strategy + Cron 4h fixe opérationnel ! Tapez /list pour vos actifs.")
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not LAST_SCAN_LOGS["timestamp"]:
-        await update.message.reply_text("Aucun scan n'a encore été exécuté depuis le dernier démarrage.")
+        await update.message.reply_text("Aucun scan n'a encore été exécuté.")
         return
 
     msg = f"📊 **Rapport du Dernier Scan ({LAST_SCAN_LOGS['timestamp']})**\n\n"
@@ -412,14 +448,17 @@ async def main():
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         
-        logging.info("Démarrage du scan initial...")
+        # Lancement du scan initial au démarrage
         asyncio.create_task(run_scan_job())
+        
+        # Démarrage de la boucle Cron automatique aux heures fixes (0h, 4h, 8h, 12h, 16h, 20h)
+        asyncio.create_task(scheduled_cron_loop())
         
         if TELEGRAM_CHAT_ID:
             try:
                 await telegram_app.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID, 
-                    text="⚡ **Bot mis à jour avec la stratégie EMA 10/35/55 + R:R >= 2.7 !**\nCommandes : /logs, /scan, /list, /gainers, /losers", 
+                    text="⚡ **Bot actif ! Planificateur 4h fixe démarré.**\nSignaux calqués sur votre stratégie TradingView.", 
                     parse_mode="Markdown"
                 )
             except Exception as e:
