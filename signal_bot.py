@@ -1,26 +1,67 @@
+"""
+=====================================================================
+ SIGNAL BOT — Bot de trading crypto automatisé (Telegram + Render)
+=====================================================================
+
+ARCHITECTURE (à lire avant de modifier quoi que ce soit) :
+
+1. Ce script tourne comme un "Web Service" persistant sur Render
+   (plan Free). Il expose un serveur HTTP minimal pour deux raisons :
+     - Render exige qu'un Web Service écoute sur $PORT.
+     - /health sert de cible de "réveil" pour un service externe
+       (cron-job.org), qui l'appelle à heures fixes (00h/04h/08h/
+       12h/16h/20h UTC). C'est CETTE requête HTTP qui réveille le
+       container quand il est en veille (plan Free = mise en veille
+       après ~15 min d'inactivité).
+
+2. Il n'y a AUCUN scheduler interne (asyncio.sleep en boucle) — sur
+   le plan Free, le process ne reste jamais éveillé assez longtemps
+   (4h) pour qu'un tel mécanisme serve à quelque chose. À la place :
+   l'analyse est lancée IMMÉDIATEMENT à chaque démarrage du process,
+   car chaque démarrage correspond justement à un réveil programmé
+   par cron-job.org.
+
+3. cron-job.org doit cibler /health, JAMAIS /scan directement :
+   /scan déclenche des appels Binance qui peuvent être lents pendant
+   le démarrage à froid (cold start) et faire échouer le ping externe.
+
+4. Un seul déploiement doit tourner à la fois. Ne JAMAIS faire
+   tourner ce script simultanément sur Render ET via GitHub Actions
+   avec le même TELEGRAM_BOT_TOKEN — Telegram refuse plusieurs
+   connexions de polling simultanées sur un même bot (erreur 409).
+
+5. Persistance via Supabase (table "state" pour la liste des actifs
+   suivis, table "signal_state" pour éviter les alertes en double).
+   Si Supabase est indisponible, le bot continue de fonctionner avec
+   des valeurs par défaut en mémoire (dégradation gracieuse).
+=====================================================================
+"""
+
 import os
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from aiohttp import web
-import ccxt.async_support as ccxt
+
 import pandas as pd
 import ta
+import ccxt.async_support as ccxt
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from supabase import create_client, Client
 
-# Logging configuration
+# --- Logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Tokens & Configs
+# --- Configuration ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PORT = int(os.getenv("PORT", 8080))
 
-# Supabase Credentials
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+CAMEROUN_OFFSET_HEURES = 1  # WAT = UTC+1, pas de changement d'heure
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -28,8 +69,10 @@ if SUPABASE_URL and SUPABASE_KEY:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as e:
         logging.error(f"Erreur d'initialisation Supabase : {e}")
+else:
+    logging.warning("SUPABASE_URL / SUPABASE_KEY absents — fonctionnement en mode dégradé (mémoire locale uniquement).")
 
-# Default Assets Configuration (Sans leverage)
+# --- Actifs suivis par défaut ---
 DEFAULT_ASSETS = {
     "BTC/USDT": {"enabled": True, "timeframe": "4h"},
     "ETH/USDT": {"enabled": True, "timeframe": "4h"},
@@ -38,437 +81,445 @@ DEFAULT_ASSETS = {
     "XRP/USDT": {"enabled": True, "timeframe": "4h"},
 }
 
-# Mémoire globale pour stocker les logs du dernier scan
-LAST_SCAN_LOGS = {
-    "timestamp": None,
-    "details": [],
-    "signals": []
-}
+# --- Persistance : liste des actifs suivis (table "state") ---
 
 def load_state():
     if not supabase:
-        logging.warning("Supabase non connecté. Utilisation de la liste locale par défaut.")
         return DEFAULT_ASSETS.copy()
-    
     try:
         response = supabase.table("state").select("data").eq("id", 1).execute()
-        if response.data and len(response.data) > 0 and response.data[0]["data"]:
+        if response.data and response.data[0].get("data"):
             return response.data[0]["data"]
     except Exception as e:
-        logging.error(f"Erreur chargement Supabase : {e}")
-    
+        logging.error(f"Erreur chargement Supabase (state) : {e}")
     return DEFAULT_ASSETS.copy()
 
 def save_state(state):
     if not supabase:
         logging.error("Impossible de sauvegarder : Supabase non configuré.")
         return False
-        
     try:
-        supabase.table("state").update({"data": state}).eq("id", 1).execute()
+        supabase.table("state").upsert({"id": 1, "data": state}).execute()
         return True
     except Exception as e:
-        logging.error(f"Erreur sauvegarde Supabase : {e}")
+        logging.error(f"Erreur sauvegarde Supabase (state) : {e}")
         return False
 
+# --- Persistance : anti-doublon des signaux (table "signal_state") ---
+
+def load_signal_state():
+    if not supabase:
+        return {}
+    try:
+        response = supabase.table("signal_state").select("data").eq("id", 1).execute()
+        if response.data and response.data[0].get("data"):
+            return response.data[0]["data"]
+    except Exception as e:
+        logging.error(f"Erreur chargement Supabase (signal_state) : {e}")
+    return {}
+
+def save_signal_state(state):
+    if not supabase:
+        return False
+    try:
+        supabase.table("signal_state").upsert({"id": 1, "data": state}).execute()
+        return True
+    except Exception as e:
+        logging.error(f"Erreur sauvegarde Supabase (signal_state) : {e}")
+        return False
+
+# --- État global ---
 STATE = load_state()
 telegram_app = None
+LAST_SCAN_LOGS = {"timestamp": None, "details": [], "signals": []}
 
-async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
-    valid_timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d', '3d', '1w', '1M']
-    if not timeframe or timeframe not in valid_timeframes:
-        timeframe = "4h"
+# --- Utilitaires ---
 
-    exchange = ccxt.binance({
-        'enableRateLimit': True, 
-        'rateLimit': 2000,
-        'timeout': 10000,
-        'options': {'defaultType': 'spot'}
-    })
-    try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    except Exception as e:
-        logging.error(f"Erreur récupération données pour {symbol}: {e}")
-        return None
-    finally:
-        await exchange.close()
+def format_dual_time(dt_utc: datetime) -> str:
+    heure_cameroun = dt_utc + timedelta(hours=CAMEROUN_OFFSET_HEURES)
+    return f"{dt_utc.strftime('%H:%M')} UTC ({heure_cameroun.strftime('%H:%M')} heure du Cameroun)"
+
+# --- Récupération de données Binance ---
+
+async def fetch_ohlcv(symbol, timeframe="4h", limit=100, retries=2):
+    for attempt in range(retries):
+        exchange = ccxt.binance({
+            'enableRateLimit': True,
+            'timeout': 15000,
+            'options': {'defaultType': 'spot'}
+        })
+        try:
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        except Exception as e:
+            logging.error(f"Erreur récupération données pour {symbol} (tentative {attempt+1}/{retries}) : {e}")
+            if attempt == retries - 1:
+                return None
+            await asyncio.sleep(2)
+        finally:
+            await exchange.close()
+    return None
 
 async def fetch_top_movers(limit=5, fetch_gainers=True):
-    exchange = ccxt.binance({
-        'enableRateLimit': True,
-        'rateLimit': 2000,
-        'timeout': 10000
-    })
+    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 15000})
     try:
         tickers = await exchange.fetch_tickers()
         usdt_tickers = []
-        
         for symbol, ticker in tickers.items():
             if symbol.endswith('/USDT') and ticker.get('percentage') is not None:
-                usdt_tickers.append({
-                    'symbol': symbol,
-                    'change': ticker['percentage'],
-                    'price': ticker['last']
-                })
-        
+                usdt_tickers.append({'symbol': symbol, 'change': ticker['percentage'], 'price': ticker['last']})
         usdt_tickers.sort(key=lambda x: x['change'], reverse=fetch_gainers)
         return usdt_tickers[:limit]
     except Exception as e:
-        logging.error(f"Erreur lors de la récupération des movers 24h : {e}")
+        logging.error(f"Erreur récupération top movers : {e}")
         return []
     finally:
         await exchange.close()
 
+# --- Indicateurs & stratégie ---
+
 def calculate_indicators(df):
-    """Calcul EMA 10, MA 35 (Lissée / RMA) et EMA 55."""
+    """EMA 10, MA 35 (RMA), EMA 55."""
     df['ema_10'] = ta.trend.ema_indicator(df['close'], window=10)
-    # RMA (Running Moving Average) identique à ta.rma(close, 35) dans TradingView
-    df['ma_35'] = df['close'].ewm(alpha=1/35, adjust=False).mean()
+    df['ma_35'] = df['close'].ewm(alpha=1/35, adjust=False).mean()  # équivalent à ta.rma(close, 35)
     df['ema_55'] = ta.trend.ema_indicator(df['close'], window=55)
     return df
 
 def generate_signal_and_calc_rr(df):
     """
-    Stratégie calquée à 100 % sur Pine Script :
-    - Cassure : EMA 10 sort au-dessus/en-dessous de MA 35 et EMA 55.
-    - Retest : Unique 1er retest dans la fenêtre des 20 bougies (les retests suivants sont ignorés).
-    - Filtre Tendance : close > MA 35 (pour BUY) ou close < MA 35 (pour SELL).
-    - SL (10 bougies) / TP (60 bougies) + Filtre R:R >= 2.7.
+    Deux types de signaux distincts, mêmes filtres pour les deux :
+      1. Cassure : l'EMA10 passe au-dessus (ou en dessous) de la MA35 ET de l'EMA55.
+      2. Retest  : premier retest de l'EMA10 après une cassure récente (fenêtre de 20 bougies).
+    Filtres appliqués aux deux : tendance (MA35) puis Risk/Reward >= 2.7.
     """
     if len(df) < 65:
         return None, "Données insuffisantes (< 65 bougies)", None, None, None
 
     curr = df.iloc[-1]
-    prev = df.iloc[-2]
     curr_price = curr['close']
-    
+
     signal_type = None
     setup_direction = None
 
-    # Conditions de sortie globale de l'EMA 10 vis-à-vis de MA35 et EMA55
     df['ema_above_both'] = (df['ema_10'] > df['ma_35']) & (df['ema_10'] > df['ema_55'])
     df['ema_below_both'] = (df['ema_10'] < df['ma_35']) & (df['ema_10'] < df['ema_55'])
 
-    # 1. Détection Cassure directe sur la dernière bougie
+    # 1. Cassure sur la dernière bougie
     breakout_up = df['ema_above_both'].iloc[-1] and not df['ema_above_both'].iloc[-2]
     breakout_down = df['ema_below_both'].iloc[-1] and not df['ema_below_both'].iloc[-2]
 
     if breakout_up:
-        signal_type = "Cassure"
-        setup_direction = "BUY"
+        signal_type, setup_direction = "Cassure", "BUY"
     elif breakout_down:
-        signal_type = "Cassure"
-        setup_direction = "SELL"
+        signal_type, setup_direction = "Cassure", "SELL"
 
-    # 2. Détection du PREMIER Retest uniquement (Fenêtre max 20 bougies)
+    # 2. Premier retest uniquement (fenêtre 20 bougies)
     if not setup_direction:
-        # Recherche du dernier point de cassure dans l'historique récent (jusqu'à 20 bougies)
-        lookback = df.iloc[-21:-1].copy() # Exclut la bougie actuelle pour chercher l'origine
-        
-        # Trouver la bougie où la cassure s'est produite
-        breakout_up_indices = lookback.index[(lookback['ema_above_both']) & (~lookback['ema_above_both'].shift(1, fill_value=False))].tolist()
-        breakout_down_indices = lookback.index[(lookback['ema_below_both']) & (~lookback['ema_below_both'].shift(1, fill_value=False))].tolist()
+        lookback = df.iloc[-21:-1].copy()
+        breakout_up_idx = lookback.index[(lookback['ema_above_both']) & (~lookback['ema_above_both'].shift(1, fill_value=False))].tolist()
+        breakout_down_idx = lookback.index[(lookback['ema_below_both']) & (~lookback['ema_below_both'].shift(1, fill_value=False))].tolist()
 
-        if breakout_up_indices:
-            last_breakout_idx = breakout_up_indices[-1]
-            # Extraire les bougies entre la cassure et la bougie précédente
-            sub_seq = df.loc[last_breakout_idx : df.index[-2]]
-            
-            # Vérifier si un retest A DÉJÀ eu lieu dans cette sous-séquence
+        if breakout_up_idx:
+            last_idx = breakout_up_idx[-1]
+            sub_seq = df.loc[last_idx: df.index[-2]]
             already_retested = any((sub_seq['low'] <= sub_seq['ema_10']) & (sub_seq['close'] > sub_seq['ema_10']))
-            
-            # Condition du 1er retest sur la bougie actuelle
             curr_retest = (curr['low'] <= curr['ema_10']) and (curr['close'] > curr['ema_10'])
-            
             if curr_retest and not already_retested:
-                signal_type = "Retest"
-                setup_direction = "BUY"
+                signal_type, setup_direction = "Retest", "BUY"
 
-        elif breakout_down_indices:
-            last_breakout_idx = breakout_down_indices[-1]
-            sub_seq = df.loc[last_breakout_idx : df.index[-2]]
-            
+        elif breakout_down_idx:
+            last_idx = breakout_down_idx[-1]
+            sub_seq = df.loc[last_idx: df.index[-2]]
             already_retested = any((sub_seq['high'] >= sub_seq['ema_10']) & (sub_seq['close'] < sub_seq['ema_10']))
-            
             curr_retest = (curr['high'] >= curr['ema_10']) and (curr['close'] < curr['ema_10'])
-            
             if curr_retest and not already_retested:
-                signal_type = "Retest"
-                setup_direction = "SELL"
+                signal_type, setup_direction = "Retest", "SELL"
 
     if not setup_direction:
-        return None, "Pas de signal (Ni cassure ni 1er retest valide)", None, None, None
+        return None, "Pas de signal (ni cassure, ni premier retest valide)", None, None, None
 
-    # 3. Filtre de Tendance MA 35
+    # 3. Filtre de tendance (MA 35) — s'applique aux deux types de signal
     if setup_direction == "BUY" and curr['close'] <= curr['ma_35']:
-        return None, "REJETÉ: Prix sous la MA 35 (Tendance Baissière)", None, None, None
+        return None, "Rejeté : prix sous la MA 35", None, None, None
     if setup_direction == "SELL" and curr['close'] >= curr['ma_35']:
-        return None, "REJETÉ: Prix au-dessus de la MA 35 (Tendance Haussière)", None, None, None
+        return None, "Rejeté : prix au-dessus de la MA 35", None, None, None
 
-    # 4. Calcul TP / SL (SL: 10 bougies, TP: 60 bougies)
+    # 4. SL (10 bougies) / TP (60 bougies)
     lookback_sl = df.iloc[-10:]
     lookback_tp = df.iloc[-60:]
 
     if setup_direction == "BUY":
         sl = lookback_sl['low'].min()
         tp = lookback_tp['high'].max()
-        risk = curr_price - sl
-        reward = tp - curr_price
-    else: # SELL
+        risk, reward = curr_price - sl, tp - curr_price
+    else:
         sl = lookback_sl['high'].max()
         tp = lookback_tp['low'].min()
-        risk = sl - curr_price
-        reward = curr_price - tp
+        risk, reward = sl - curr_price, curr_price - tp
 
     if risk <= 0 or reward <= 0:
-        return None, f"Configuration invalide ({setup_direction}): SL/TP incohérent", sl, tp, 0
+        return None, "Configuration invalide : SL/TP incohérent", sl, tp, 0
 
     rr_ratio = round(reward / risk, 2)
 
-    # 5. Filtre Risk/Reward min 2.7
+    # 5. Filtre Risk/Reward >= 2.7 — s'applique aux deux types de signal
     if rr_ratio < 2.7:
-        reason = f"Signal {setup_direction} ({signal_type}) REJETÉ: R:R = {rr_ratio} < 2.7 (SL: {sl:.4f}, TP: {tp:.4f})"
-        return None, reason, sl, tp, rr_ratio
+        return None, f"Rejeté : R:R = {rr_ratio} < 2.7", sl, tp, rr_ratio
 
-    valid_reason = f"Signal {setup_direction} ({signal_type}) VALIDE: R:R = {rr_ratio} >= 2.7"
-    return setup_direction, valid_reason, sl, tp, rr_ratio
+    return setup_direction, f"Valide ({signal_type}) — R:R = {rr_ratio}", sl, tp, rr_ratio
+
+# --- Scan principal ---
 
 async def run_scan_job():
     global LAST_SCAN_LOGS
-    logging.info("Lancement du scan des marchés...")
-    
+    scan_time = datetime.utcnow()
+    logging.info("Lancement de l'analyse des marchés...")
+
     LAST_SCAN_LOGS = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "timestamp": scan_time.strftime("%Y-%m-%d %H:%M:%S UTC"),
         "details": [],
         "signals": []
     }
-    signals_sent = 0
-    
+
+    signal_state = load_signal_state()
+    new_signals = []
+
     for symbol, config in list(STATE.items()):
         if not config.get("enabled", True):
-            LAST_SCAN_LOGS["details"].append(f"⚪ **{symbol}**: Désactivé")
             continue
-        
+
         timeframe = config.get("timeframe", "4h")
-        
         try:
             df = await fetch_ohlcv(symbol, timeframe=timeframe)
-            await asyncio.sleep(2.0)
-            
+            await asyncio.sleep(1.0)  # marge de sécurité anti rate-limit Binance
+
             if df is None or df.empty:
-                LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}**: Erreur de données OHLCV")
+                LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}** : données indisponibles.")
                 continue
-                
+
             df = calculate_indicators(df)
-            signal, filter_reason, sl, tp, rr = generate_signal_and_calc_rr(df)
-            
-            curr_price = df.iloc[-1]['close']
-            log_line = f"**{symbol}** ({timeframe}): Prix={curr_price} | Filter: {filter_reason}"
-            LAST_SCAN_LOGS["details"].append(log_line)
-            
-            if signal:
-                LAST_SCAN_LOGS["signals"].append(
-                    f"🚨 **{signal}** sur **{symbol}** à {curr_price} (SL: {sl:.4f}, TP: {tp:.4f}, R:R: {rr})"
-                )
-                
-                if telegram_app and TELEGRAM_CHAT_ID:
-                    message = (
-                        f"🚨 **SIGNAL DETECTED** 🚨\n\n"
-                        f"**Asset:** {symbol}\n"
-                        f"**Direction:** {signal}\n"
-                        f"**Price:** {curr_price}\n"
-                        f"**Stop-Loss:** {sl:.4f}\n"
-                        f"**Take-Profit:** {tp:.4f}\n"
-                        f"**Risk/Reward:** {rr}\n"
-                        f"**Timeframe:** {timeframe}"
-                    )
-                    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-                    signals_sent += 1
+            direction, reason, sl, tp, rr = generate_signal_and_calc_rr(df)
+
+            curr = df.iloc[-1]
+            LAST_SCAN_LOGS["details"].append(f"**{symbol}** : {curr['close']} | {reason}")
+
+            if direction:
+                bar_time = curr['timestamp'].isoformat()
+                previous = signal_state.get(symbol, {})
+                is_duplicate = previous.get("bar_time") == bar_time and previous.get("direction") == direction
+
+                if not is_duplicate:
+                    signal_type = "Cassure" if "Cassure" in reason else "Retest"
+                    new_signals.append({
+                        "symbol": symbol, "direction": direction, "signal_type": signal_type,
+                        "price": curr['close'], "sl": sl, "tp": tp, "rr": rr, "timeframe": timeframe
+                    })
+                    signal_state[symbol] = {"bar_time": bar_time, "direction": direction}
+                else:
+                    LAST_SCAN_LOGS["details"][-1] += " (déjà notifié précédemment)"
+
         except Exception as e:
-            logging.error(f"Erreur lors du traitement de {symbol}: {e}")
-            LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}**: Exception {e}")
+            logging.error(f"Erreur lors du traitement de {symbol} : {e}")
+            LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}** : {e}")
             continue
-                
-    if telegram_app and TELEGRAM_CHAT_ID:
-        try:
-            await telegram_app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID, 
-                text=f"✅ Scan terminé ({signals_sent} signal/s trouvé/s). Tapez /logs pour les détails."
-            )
-        except Exception as e:
-            logging.error(f"Erreur envoi notification fin de scan : {e}")
 
-async def scheduled_cron_loop():
-    """Planificateur 4h fixe (00h, 04h, 08h, 12h, 16h, 20h UTC)."""
-    while True:
-        now = datetime.utcnow()
-        next_hour = ((now.hour // 4) + 1) * 4
-        if next_hour >= 24:
-            next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            next_run = now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
-            
-        wait_seconds = (next_run - now).total_seconds()
-        logging.info(f"Prochain scan automatique à : {next_run.strftime('%Y-%m-%d %H:%M:%S UTC')} (attente: {int(wait_seconds)}s)")
-        
-        await asyncio.sleep(wait_seconds)
-        await run_scan_job()
+    save_signal_state(signal_state)
 
-# Commandes Telegram
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot EMA Strategy (Premier Retest Uniquement) opérationnel ! Tapez /list pour vos actifs.")
-
-async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not LAST_SCAN_LOGS["timestamp"]:
-        await update.message.reply_text("Aucun scan n'a encore été exécuté.")
+    if not (telegram_app and TELEGRAM_CHAT_ID):
         return
 
-    msg = f"📊 **Rapport du Dernier Scan ({LAST_SCAN_LOGS['timestamp']})**\n\n"
-    
-    msg += "🚨 **Signaux Valides Détectés :**\n"
-    if LAST_SCAN_LOGS["signals"]:
-        for sig in LAST_SCAN_LOGS["signals"]:
-            msg += f"{sig}\n"
+    # Envoi des signaux individuels
+    for sig in new_signals:
+        emoji_dir = "📈" if sig["direction"] == "BUY" else "📉"
+        message = (
+            f"🚨 **Nouveau signal détecté** {emoji_dir}\n\n"
+            f"**Actif :** {sig['symbol']}\n"
+            f"**Direction :** {sig['direction']}\n"
+            f"**Type :** {sig['signal_type']}\n"
+            f"**Prix d'entrée :** {sig['price']}\n"
+            f"🛑 **Stop-Loss :** {sig['sl']:.4f}\n"
+            f"🎯 **Take-Profit :** {sig['tp']:.4f}\n"
+            f"⚖️ **Risk/Reward :** {sig['rr']}\n"
+            f"⏱ **Timeframe :** {sig['timeframe']}"
+        )
+        try:
+            await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Erreur envoi Telegram (signal) : {e}")
+
+    LAST_SCAN_LOGS["signals"] = [f"{s['symbol']} {s['direction']} ({s['signal_type']})" for s in new_signals]
+    heure_affichage = format_dual_time(scan_time)
+    nb_actifs = len([s for s in STATE.values() if s.get("enabled", True)])
+
+    if new_signals:
+        recap = (
+            f"✅ **Analyse terminée** — {heure_affichage}\n\n"
+            f"🎯 {len(new_signals)} signal(s) détecté(s) sur {nb_actifs} actif(s) surveillé(s).\n"
+            f"Le détail est ci-dessus. Tapez /logs pour la synthèse complète."
+        )
     else:
-        msg += "Aucun signal validé.\n"
-        
-    msg += "\n🔎 **Détail des Filtres Appliqués :**\n"
-    for detail in LAST_SCAN_LOGS["details"]:
-        msg += f"• {detail}\n"
-        
-    if len(msg) > 4000:
-        for i in range(0, len(msg), 4000):
-            await update.message.reply_text(msg[i:i+4000], parse_mode="Markdown")
-    else:
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        recap = (
+            f"✅ **Analyse terminée** — {heure_affichage}\n\n"
+            f"📭 Aucune opportunité ne remplit nos critères pour le moment sur les {nb_actifs} actif(s) surveillé(s).\n"
+            f"Prochaine analyse automatique dans 4 heures. Tapez /logs pour le détail par actif."
+        )
+    try:
+        await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=recap, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Erreur envoi Telegram (récapitulatif) : {e}")
+
+# --- Commandes Telegram ---
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Bonjour ! Je suis votre assistant de trading automatisé.\n\n"
+        "Je surveille les marchés crypto en continu et je vous alerte dès qu'une "
+        "opportunité conforme à notre stratégie se présente — toutes les 4 heures "
+        "(00h, 04h, 08h, 12h, 16h, 20h UTC).\n\n"
+        "📋 **Commandes disponibles :**\n"
+        "/scan — lancer une analyse manuelle\n"
+        "/list — voir les actifs suivis\n"
+        "/add_asset — ajouter un actif à la liste\n"
+        "/remove_asset — retirer un actif\n"
+        "/gainers — top 5 hausses (24h)\n"
+        "/losers — top 5 baisses (24h)\n"
+        "/logs — détail de la dernière analyse",
+        parse_mode="Markdown"
+    )
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not STATE:
-        await update.message.reply_text("Aucun actif enregistré.")
+        await update.message.reply_text("📭 Aucun actif suivi pour le moment.")
         return
-    
-    msg = "📋 **Liste des actifs suivis :**\n\n"
+    msg = "📋 **Actifs actuellement suivis :**\n\n"
     for symbol, cfg in STATE.items():
-        status = "✅" if cfg.get("enabled", True) else "❌"
-        msg += f"{status} **{symbol}** | TF: {cfg.get('timeframe', '4h')}\n"
-    
+        status = "✅" if cfg.get("enabled", True) else "⏸️"
+        msg += f"{status} **{symbol}** — timeframe {cfg.get('timeframe', '4h')}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /add_asset <SYMBOL> [timeframe]\nExemple: /add_asset SOL/USDT 4h")
+        await update.message.reply_text(
+            "ℹ️ Usage : `/add_asset SYMBOLE [timeframe]`\nExemple : `/add_asset SOL/USDT 4h`",
+            parse_mode="Markdown"
+        )
         return
-    
     symbol = args[0].upper()
     tf = args[1] if len(args) > 1 else "4h"
-    
     STATE[symbol] = {"enabled": True, "timeframe": tf}
-    success = save_state(STATE)
-    
-    if success:
-        await update.message.reply_text(f"✅ Actif **{symbol}** ({tf}) ajouté et sauvegardé !", parse_mode="Markdown")
+    if save_state(STATE):
+        await update.message.reply_text(f"✅ **{symbol}** a été ajouté à la liste de suivi (timeframe {tf}).", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"⚠️ **{symbol}** ajouté localement, mais échec de sauvegarde sur Supabase.", parse_mode="Markdown")
+        await update.message.reply_text(f"⚠️ **{symbol}** ajouté localement, mais la sauvegarde Supabase a échoué.", parse_mode="Markdown")
 
 async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("Usage: /remove_asset <SYMBOL>\nExemple: /remove_asset BTC/USDT")
+        await update.message.reply_text("ℹ️ Usage : `/remove_asset SYMBOLE`\nExemple : `/remove_asset BTC/USDT`", parse_mode="Markdown")
         return
-    
     symbol = args[0].upper()
     if symbol in STATE:
         del STATE[symbol]
-        success = save_state(STATE)
-        if success:
-            await update.message.reply_text(f"🗑️ Actif **{symbol}** supprimé et mis à jour sur Supabase !", parse_mode="Markdown")
+        if save_state(STATE):
+            await update.message.reply_text(f"🗑️ **{symbol}** a été retiré de la liste de suivi.", parse_mode="Markdown")
         else:
-            await update.message.reply_text(f"⚠️ **{symbol}** supprimé localement, mais échec de sauvegarde sur Supabase.", parse_mode="Markdown")
+            await update.message.reply_text(f"⚠️ **{symbol}** retiré localement, mais la sauvegarde Supabase a échoué.", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"Actif {symbol} introuvable dans la liste.")
+        await update.message.reply_text(f"❓ **{symbol}** ne fait pas partie de la liste actuelle.", parse_mode="Markdown")
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Lancement du scan manuel...")
-    asyncio.create_task(run_scan_job())
+    await update.message.reply_text("🔍 Analyse manuelle en cours, merci de patienter quelques instants...")
+    await run_scan_job()
 
 async def gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Récupération du Top Gainers 24h...")
+    await update.message.reply_text("🚀 Récupération du classement des plus fortes hausses (24h)...")
     movers = await fetch_top_movers(limit=5, fetch_gainers=True)
     if not movers:
-        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
+        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance pour le moment.")
         return
-    
-    msg = "🔥 **Top 5 Gainers Binance (24h) :**\n\n"
+    msg = "🔥 **Top 5 hausses Binance (24h) :**\n\n"
     for item in movers:
-        msg += f"🟢 **{item['symbol']}** : +{item['change']:.2f}% | Prix: {item['price']}\n"
+        msg += f"🟢 **{item['symbol']}** : +{item['change']:.2f}% — {item['price']}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📉 Récupération du Top Losers 24h...")
+    await update.message.reply_text("📉 Récupération du classement des plus fortes baisses (24h)...")
     movers = await fetch_top_movers(limit=5, fetch_gainers=False)
     if not movers:
-        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance.")
+        await update.message.reply_text("⚠️ Impossible de récupérer les données Binance pour le moment.")
         return
-    
-    msg = "🔻 **Top 5 Losers Binance (24h) :**\n\n"
+    msg = "🔻 **Top 5 baisses Binance (24h) :**\n\n"
     for item in movers:
-        msg += f"🔴 **{item['symbol']}** : {item['change']:.2f}% | Prix: {item['price']}\n"
+        msg += f"🔴 **{item['symbol']}** : {item['change']:.2f}% — {item['price']}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def handle_scan_request(request):
-    asyncio.create_task(run_scan_job())
-    return web.Response(text="Scan Job triggered successfully.", status=200)
+async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not LAST_SCAN_LOGS["timestamp"]:
+        await update.message.reply_text("📭 Aucune analyse n'a encore été effectuée.")
+        return
+    msg = f"📊 **Détail de la dernière analyse** — {LAST_SCAN_LOGS['timestamp']}\n\n"
+    msg += "🚨 **Signaux détectés :**\n"
+    msg += ("\n".join(f"• {s}" for s in LAST_SCAN_LOGS["signals"]) if LAST_SCAN_LOGS["signals"] else "Aucun.")
+    msg += "\n\n🔎 **Détail par actif (stratégie & filtres) :**\n"
+    msg += "\n".join(f"• {d}" for d in LAST_SCAN_LOGS["details"])
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def handle_ping_request(request):
-    return web.Response(text="PONG", status=200)
+# --- Serveur HTTP ---
+
+async def handle_health(request):
+    """Cible de réveil pour cron-job.org. Réponse instantanée, sans appel Binance."""
+    return web.Response(text="Bot actif ✅", status=200)
+
+async def handle_scan_request(request):
+    """Déclenchement manuel optionnel via HTTP. NE PAS utiliser pour le réveil programmé (voir /health)."""
+    asyncio.create_task(run_scan_job())
+    return web.Response(text="Analyse déclenchée avec succès.", status=200)
+
+# --- Point d'entrée ---
 
 async def main():
     global telegram_app
-    
+
     server = web.Application()
+    server.router.add_get('/health', handle_health)
+    server.router.add_get('/', handle_health)
     server.router.add_get('/scan', handle_scan_request)
-    server.router.add_get('/ping', handle_ping_request)
-    server.router.add_get('/', lambda r: web.Response(text="Signal Bot is Running.", status=200))
-    
+
     runner = web.AppRunner(server)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
+    logging.info(f"Serveur HTTP démarré sur le port {PORT} (cible de réveil : /health).")
 
-    if TELEGRAM_BOT_TOKEN:
-        telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        telegram_app.add_handler(CommandHandler("start", start_cmd))
-        telegram_app.add_handler(CommandHandler("logs", logs_cmd))
-        telegram_app.add_handler(CommandHandler("list", list_cmd))
-        telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
-        telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
-        telegram_app.add_handler(CommandHandler("scan", scan_cmd))
-        telegram_app.add_handler(CommandHandler("gainers", gainers_cmd))
-        telegram_app.add_handler(CommandHandler("losers", losers_cmd))
-        
-        await telegram_app.initialize()
-        await telegram_app.start()
-        await telegram_app.updater.start_polling(drop_pending_updates=True)
-        
-        # Scan au lancement + Lancement du cron 4h fixe
-        asyncio.create_task(run_scan_job())
-        asyncio.create_task(scheduled_cron_loop())
-        
-        if TELEGRAM_CHAT_ID:
-            try:
-                await telegram_app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID, 
-                    text="⚡ **Bot mis à jour ! Règle du premier retest unique activée (Leverage supprimé).**", 
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logging.error(f"Erreur envoi notification de lancement : {e}")
-    
+    if not TELEGRAM_BOT_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN manquant — le bot Telegram ne peut pas démarrer.")
+        await asyncio.Event().wait()
+        return
+
+    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", start_cmd))
+    telegram_app.add_handler(CommandHandler("scan", scan_cmd))
+    telegram_app.add_handler(CommandHandler("list", list_cmd))
+    telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
+    telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
+    telegram_app.add_handler(CommandHandler("gainers", gainers_cmd))
+    telegram_app.add_handler(CommandHandler("losers", losers_cmd))
+    telegram_app.add_handler(CommandHandler("logs", logs_cmd))
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
+    logging.info("Bot Telegram démarré, écoute des commandes active.")
+
+    # Ce démarrage correspond à un réveil programmé (cron-job.org -> /health) :
+    # on lance donc l'analyse automatique immédiatement, en tâche de fond.
+    asyncio.create_task(run_scan_job())
+
+    # Le process reste vivant pour servir les commandes Telegram et /health,
+    # jusqu'à ce que Render le remette en veille par inactivité (plan Free, ~15 min).
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
