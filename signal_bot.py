@@ -1,6 +1,6 @@
 """
 =====================================================================
- SIGNAL BOT — Bot de trading crypto automatisé (Telegram +Github + Render)
+ SIGNAL BOT — Bot de trading crypto automatisé (Telegram +Github +  Render)
 =====================================================================
 
 ARCHITECTURE (à lire avant de modifier quoi que ce soit) :
@@ -139,44 +139,75 @@ def format_dual_time(dt_utc: datetime) -> str:
     heure_cameroun = dt_utc + timedelta(hours=CAMEROUN_OFFSET_HEURES)
     return f"{dt_utc.strftime('%H:%M')} UTC ({heure_cameroun.strftime('%H:%M')} heure du Cameroun)"
 
-# --- Récupération de données Binance ---
+# --- Récupération de données (Binance en priorité, Bybit en secours) ---
 
-async def fetch_ohlcv(symbol, timeframe="4h", limit=100, retries=2):
-    for attempt in range(retries):
-        exchange = ccxt.binance({
+EXCHANGE_FALLBACK_ORDER = ["binance", "bybit"]
+_EXCHANGE_CLASSES = {"binance": ccxt.binance, "bybit": ccxt.bybit}
+
+def _is_ip_ban_error(exception) -> bool:
+    """Détecte un bannissement IP (ex: Binance -1003 / HTTP 418) — inutile de réessayer sur le même exchange."""
+    msg = str(exception)
+    return "-1003" in msg or "banned until" in msg.lower() or " 418 " in f" {msg} "
+
+async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
+    """
+    Essaie chaque exchange de EXCHANGE_FALLBACK_ORDER dans l'ordre. Si un
+    bannissement IP est détecté, on bascule immédiatement sur l'exchange
+    suivant sans gaspiller de tentatives inutiles (le bannissement ne se
+    lèvera pas plus vite en insistant). Pour les autres erreurs (timeout,
+    blip réseau ponctuel), on retente une fois sur le même exchange avant
+    de basculer.
+    """
+    for exchange_id in EXCHANGE_FALLBACK_ORDER:
+        exchange = _EXCHANGE_CLASSES[exchange_id]({
             'enableRateLimit': True,
             'timeout': 15000,
             'options': {'defaultType': 'spot'}
         })
+        max_attempts = 2
         try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df
-        except Exception as e:
-            logging.error(f"Erreur récupération données pour {symbol} (tentative {attempt+1}/{retries}) : {e}")
-            if attempt == retries - 1:
-                return None
-            await asyncio.sleep(2)
+            for attempt in range(max_attempts):
+                try:
+                    ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.attrs['source_exchange'] = exchange_id
+                    if exchange_id != EXCHANGE_FALLBACK_ORDER[0]:
+                        logging.warning(f"{symbol} : données récupérées via {exchange_id} (secours).")
+                    return df
+                except Exception as e:
+                    if _is_ip_ban_error(e):
+                        logging.warning(f"{symbol} : IP bannie sur {exchange_id} — bascule immédiate, pas de nouvelle tentative sur cet exchange.")
+                        break
+                    logging.error(f"Erreur récupération données pour {symbol} sur {exchange_id} (tentative {attempt+1}/{max_attempts}) : {e}")
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(2)
         finally:
             await exchange.close()
+
+    logging.error(f"{symbol} : échec sur tous les exchanges disponibles ({', '.join(EXCHANGE_FALLBACK_ORDER)}).")
     return None
 
 async def fetch_top_movers(limit=5, fetch_gainers=True):
-    exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 15000})
-    try:
-        tickers = await exchange.fetch_tickers()
-        usdt_tickers = []
-        for symbol, ticker in tickers.items():
-            if symbol.endswith('/USDT') and ticker.get('percentage') is not None:
-                usdt_tickers.append({'symbol': symbol, 'change': ticker['percentage'], 'price': ticker['last']})
-        usdt_tickers.sort(key=lambda x: x['change'], reverse=fetch_gainers)
-        return usdt_tickers[:limit]
-    except Exception as e:
-        logging.error(f"Erreur récupération top movers : {e}")
-        return []
-    finally:
-        await exchange.close()
+    for exchange_id in EXCHANGE_FALLBACK_ORDER:
+        exchange = _EXCHANGE_CLASSES[exchange_id]({'enableRateLimit': True, 'timeout': 15000})
+        try:
+            tickers = await exchange.fetch_tickers()
+            usdt_tickers = []
+            for symbol, ticker in tickers.items():
+                if symbol.endswith('/USDT') and ticker.get('percentage') is not None:
+                    usdt_tickers.append({'symbol': symbol, 'change': ticker['percentage'], 'price': ticker['last']})
+            usdt_tickers.sort(key=lambda x: x['change'], reverse=fetch_gainers)
+            return usdt_tickers[:limit]
+        except Exception as e:
+            if _is_ip_ban_error(e):
+                logging.warning(f"Top movers : IP bannie sur {exchange_id} — bascule immédiate.")
+            else:
+                logging.error(f"Erreur récupération top movers sur {exchange_id} : {e}")
+            continue
+        finally:
+            await exchange.close()
+    return []
 
 # --- Indicateurs & stratégie ---
 
@@ -303,7 +334,9 @@ async def run_scan_job():
             direction, reason, sl, tp, rr = generate_signal_and_calc_rr(df)
 
             curr = df.iloc[-1]
-            LAST_SCAN_LOGS["details"].append(f"**{symbol}** : {curr['close']} | {reason}")
+            source = df.attrs.get('source_exchange', 'binance')
+            source_note = "" if source == "binance" else f" _(via {source}, secours)_"
+            LAST_SCAN_LOGS["details"].append(f"**{symbol}** : {curr['close']} | {reason}{source_note}")
 
             if direction:
                 bar_time = curr['timestamp'].isoformat()
