@@ -1,6 +1,6 @@
 """
 =====================================================================
- SIGNAL BOT — Bot de trading crypto automatisé (Telegram + Render)
+ SIGNAL BOT — Bot de trading crypto automatisé (Telegram +Github + Render)
 =====================================================================
 
 ARCHITECTURE (à lire avant de modifier quoi que ce soit) :
