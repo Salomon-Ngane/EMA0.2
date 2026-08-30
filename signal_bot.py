@@ -122,11 +122,26 @@ def _is_ip_ban_error(exception) -> bool:
     return "-1003" in msg or "banned until" in msg.lower() or " 418 " in f" {msg} "
 
 def _format_timeframe_for_exchange(exchange_id: str, timeframe: str) -> str:
-    # Bybit requiert '240' ou la valeur convertie pour le timeframe 4h
+    """Convertit le timeframe au format attendu par l'exchange."""
     if exchange_id == "bybit":
-        mapping = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720", "1d": "D", "1w": "W"}
-        return mapping.get(timeframe, timeframe)
+        mapping = {
+            "1m": "1",
+            "3m": "3",
+            "5m": "5",
+            "15m": "15",
+            "30m": "30",
+            "1h": "60",
+            "2h": "120",
+            "4h": "240",
+            "6h": "360",
+            "12h": "720",
+            "1d": "D",
+            "1w": "W",
+            "1m": "M"
+        }
+        return mapping.get(str(timeframe).lower(), str(timeframe))
     return timeframe
+
 
 
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
