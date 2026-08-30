@@ -1,10 +1,11 @@
 """
 =====================================================================
- SIGNAL BOT v0.2 — Bot de trading crypto automatisé (Telegram + Render)
+ SIGNAL BOT v0.3 — Bot de trading Crypto & Deriv (Telegram + Render)
 =====================================================================
 """
 
 import os
+import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import ta
 import ccxt.async_support as ccxt
+import websockets
 from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -28,6 +30,7 @@ PORT = int(os.getenv("PORT", 8080))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")  # App ID public par défaut
 CAMEROUN_OFFSET_HEURES = 1  # WAT = UTC+1
 
 supabase: Client = None
@@ -44,8 +47,8 @@ DEFAULT_ASSETS = {
     "BTC/USDT": {"enabled": True, "timeframe": "4h"},
     "ETH/USDT": {"enabled": True, "timeframe": "4h"},
     "SOL/USDT": {"enabled": True, "timeframe": "4h"},
-    "BNB/USDT": {"enabled": True, "timeframe": "4h"},
-    "XRP/USDT": {"enabled": True, "timeframe": "4h"},
+    "R_100": {"enabled": True, "timeframe": "4h"},    # Volatility 100 Index (Deriv)
+    "R_75": {"enabled": True, "timeframe": "4h"},     # Volatility 75 Index (Deriv)
 }
 
 # --- Persistance globale dans la table "state" ---
@@ -58,7 +61,6 @@ def load_all_state():
         response = supabase.table("state").select("data").eq("id", 1).execute()
         if response.data and response.data[0].get("data"):
             data = response.data[0]["data"]
-            # Rétrocompatibilité si la structure ancienne contenait seulement les actifs
             if "assets" not in data:
                 return {"assets": data, "signal_state": {}}
             return data
@@ -91,7 +93,57 @@ def format_dual_time(dt_utc: datetime) -> str:
     heure_cameroun = dt_utc + timedelta(hours=CAMEROUN_OFFSET_HEURES)
     return f"{dt_utc.strftime('%H:%M')} UTC ({heure_cameroun.strftime('%H:%M')} heure du Cameroun)"
 
-# --- Récupération de données (Binance Vision -> Binance Std -> Bybit) ---
+def is_deriv_symbol(symbol: str) -> bool:
+    """Vérifie si le symbole appartient aux actifs Deriv (Indices Synthétiques / Forex Deriv)."""
+    sym = symbol.upper()
+    return sym.startswith("R_") or sym.startswith("1HZ") or "VOLATILITY" in sym or sym.startswith("HZ")
+
+# --- Module de données Deriv (WebSocket) ---
+
+async def fetch_deriv_ohlcv(symbol: str, timeframe: str = "4h", count: int = 100) -> pd.DataFrame:
+    """Récupère l'historique des bougies pour un indice synthétique Deriv via WebSocket."""
+    granularity_map = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800, "1d": 86400
+    }
+    granularity = granularity_map.get(str(timeframe).lower(), 14400)
+    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    
+    request_data = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": count,
+        "end": "latest",
+        "style": "candles",
+        "granularity": granularity
+    }
+    
+    try:
+        async with websockets.connect(uri) as websocket:
+            await websocket.send(json.dumps(request_data))
+            response = await websocket.recv()
+            data = json.loads(response)
+            
+            if "error" in data:
+                logging.error(f"Erreur API Deriv pour {symbol} : {data['error'].get('message')}")
+                return None
+            
+            candles = data.get("candles", [])
+            if not candles:
+                logging.warning(f"Deriv : Aucune donnée de bougies renvoyée pour {symbol}.")
+                return None
+            
+            df = pd.DataFrame(candles)
+            df = df.rename(columns={"epoch": "timestamp", "open": "open", "high": "high", "low": "low", "close": "close"})
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            df.attrs['source_exchange'] = 'deriv'
+            return df
+            
+    except Exception as e:
+        logging.error(f"Erreur connexion WebSocket Deriv ({symbol}) : {e}")
+        return None
+
+# --- Récupération Crypto (Binance / Bybit via CCXT) ---
 
 EXCHANGE_FALLBACK_ORDER = ["binance_vision", "binance", "bybit"]
 
@@ -122,29 +174,20 @@ def _is_ip_ban_error(exception) -> bool:
     return "-1003" in msg or "banned until" in msg.lower() or " 418 " in f" {msg} "
 
 def _format_timeframe_for_exchange(exchange_id: str, timeframe: str) -> str:
-    """Convertit le timeframe au format attendu par l'exchange."""
     if exchange_id == "bybit":
         mapping = {
-            "1m": "1",
-            "3m": "3",
-            "5m": "5",
-            "15m": "15",
-            "30m": "30",
-            "1h": "60",
-            "2h": "120",
-            "4h": "240",
-            "6h": "360",
-            "12h": "720",
-            "1d": "D",
-            "1w": "W",
-            "1m": "M"
+            "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+            "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
+            "1d": "D", "1w": "W", "1m": "M"
         }
         return mapping.get(str(timeframe).lower(), str(timeframe))
     return timeframe
 
+async def fetch_ohlcv(symbol: str, timeframe: str = "4h", limit: int = 100):
+    """Routeur principal : Deriv WebSocket ou Exchanges Crypto CCXT."""
+    if is_deriv_symbol(symbol):
+        return await fetch_deriv_ohlcv(symbol, timeframe=timeframe, count=limit)
 
-
-async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     for exchange_id in EXCHANGE_FALLBACK_ORDER:
         exchange = _get_exchange_instance(exchange_id)
         if not exchange:
@@ -197,7 +240,7 @@ async def fetch_top_movers(limit=5, fetch_gainers=True):
             await exchange.close()
     return []
 
-# --- Indicateurs & stratégie v0.2 ---
+# --- Indicateurs & Stratégie v0.2 ---
 
 def calculate_indicators(df):
     """EMA 10, MA 35 (RMA), EMA 55."""
@@ -272,7 +315,7 @@ def generate_signal_and_calc_rr(df):
     if setup_direction == "SELL" and curr['close'] >= curr['ma_35']:
         return None, "Rejeté : prix au-dessus de la MA 35", None, None, None
 
-    # 4. SL / TP Structurels (v0.2) avec repli v0.1
+    # 4. SL / TP Structurels (pivots + repli)
     pivots_low, pivots_high = find_pivots(df, window=5)
 
     if setup_direction == "BUY":
@@ -325,7 +368,7 @@ async def run_scan_job():
         timeframe = config.get("timeframe", "4h")
         try:
             df = await fetch_ohlcv(symbol, timeframe=timeframe)
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)
 
             if df is None or df.empty:
                 LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}** : données indisponibles.")
@@ -336,7 +379,7 @@ async def run_scan_job():
 
             curr = df.iloc[-1]
             source = df.attrs.get('source_exchange', 'bybit')
-            source_note = "" if source == "binance_vision" else f" _(via {source}, secours)_"
+            source_note = f" _(via {source})_" if source in ["deriv", "bybit"] else ""
             LAST_SCAN_LOGS["details"].append(f"**{symbol}** : {curr['close']} | {reason}{source_note}")
 
             if direction:
@@ -352,7 +395,7 @@ async def run_scan_job():
                     })
                     SIGNAL_STATE[symbol] = {"bar_time": bar_time, "direction": direction}
                 else:
-                    LAST_SCAN_LOGS["details"][-1] += " (déjà notifié précédemment)"
+                    LAST_SCAN_LOGS["details"][-1] += " (déjà notifié)"
 
         except Exception as e:
             logging.error(f"Erreur lors du traitement de {symbol} : {e}")
@@ -407,15 +450,15 @@ async def run_scan_job():
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Bonjour ! Je suis votre assistant de trading automatisé v0.2.\n\n"
-        "Je surveille les marchés crypto en continu (00h, 04h, 08h, 12h, 16h, 20h UTC).\n\n"
+        "👋 Bonjour ! Je suis votre assistant de trading Crypto & Deriv v0.3.\n\n"
+        "Je surveille les marchés crypto et les indices synthétiques Deriv (00h, 04h, 08h, 12h, 16h, 20h UTC).\n\n"
         "📋 **Commandes disponibles :**\n"
         "/scan — lancer une analyse manuelle\n"
         "/list — voir les actifs suivis\n"
-        "/add_asset — ajouter un actif à la liste\n"
+        "/add_asset — ajouter un actif (ex: `BTC/USDT` ou `R_100`)\n"
         "/remove_asset — retirer un actif\n"
-        "/gainers — top 5 hausses (24h)\n"
-        "/losers — top 5 baisses (24h)\n"
+        "/gainers — top 5 hausses crypto (24h)\n"
+        "/losers — top 5 baisses crypto (24h)\n"
         "/logs — détail de la dernière analyse",
         parse_mode="Markdown"
     )
@@ -427,13 +470,14 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "📋 **Actifs actuellement suivis :**\n\n"
     for symbol, cfg in STATE.items():
         status = "✅" if cfg.get("enabled", True) else "⏸️"
-        msg += f"{status} **{symbol}** — timeframe {cfg.get('timeframe', '4h')}\n"
+        type_str = "Deriv" if is_deriv_symbol(symbol) else "Crypto"
+        msg += f"{status} **{symbol}** ({type_str}) — timeframe {cfg.get('timeframe', '4h')}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("ℹ️ Usage : `/add_asset SYMBOLE [timeframe]`\nExemple : `/add_asset SOL/USDT 4h`", parse_mode="Markdown")
+        await update.message.reply_text("ℹ️ Usage : `/add_asset SYMBOLE [timeframe]`\nExemple Crypto : `/add_asset SOL/USDT 4h`\nExemple Deriv : `/add_asset R_100 4h`", parse_mode="Markdown")
         return
     symbol = args[0].upper()
     tf = args[1] if len(args) > 1 else "4h"
@@ -446,7 +490,7 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 1:
-        await update.message.reply_text("ℹ️ Usage : `/remove_asset SYMBOLE`\nExemple : `/remove_asset BTC/USDT`", parse_mode="Markdown")
+        await update.message.reply_text("ℹ️ Usage : `/remove_asset SYMBOLE`\nExemple : `/remove_asset R_100`", parse_mode="Markdown")
         return
     symbol = args[0].upper()
     if symbol in STATE:
@@ -463,7 +507,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan_job()
 
 async def gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Récupération du Top 5 Gainers (24h)...")
+    await update.message.reply_text("🚀 Récupération du Top 5 Gainers Crypto (24h)...")
     movers = await fetch_top_movers(limit=5, fetch_gainers=True)
     if not movers:
         await update.message.reply_text("⚠️ Impossible de récupérer les données pour le moment.")
@@ -474,7 +518,7 @@ async def gainers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def losers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📉 Récupération du Top 5 Losers (24h)...")
+    await update.message.reply_text("📉 Récupération du Top 5 Losers Crypto (24h)...")
     movers = await fetch_top_movers(limit=5, fetch_gainers=False)
     if not movers:
         await update.message.reply_text("⚠️ Impossible de récupérer les données pour le moment.")
@@ -538,7 +582,7 @@ async def main():
     await telegram_app.initialize()
     await telegram_app.start()
     await telegram_app.updater.start_polling(drop_pending_updates=True)
-    logging.info("Bot Telegram v0.2 prêt et à l'écoute.")
+    logging.info("Bot Telegram v0.3 prêt et à l'écoute.")
 
     asyncio.create_task(run_scan_job())
     await asyncio.Event().wait()
