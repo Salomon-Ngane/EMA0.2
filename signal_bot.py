@@ -8,6 +8,7 @@ import os
 import json
 import asyncio
 import logging
+import html
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -368,7 +369,10 @@ async def run_scan_job():
             curr = df.iloc[-1]
             source = df.attrs.get('source_exchange', 'bybit')
             source_note = f" <i>(via {source})</i>" if source in ["deriv", "bybit"] else ""
-            LAST_SCAN_LOGS["details"].append(f"<b>{symbol}</b> : {curr['close']} | {reason}{source_note}")
+            
+            # Échappement HTML des caractères spéciaux (<, >, &) issus de la raison du signal
+            safe_reason = html.escape(str(reason))
+            LAST_SCAN_LOGS["details"].append(f"<b>{symbol}</b> : {curr['close']} | {safe_reason}{source_note}")
 
             if direction:
                 bar_time = curr['timestamp'].isoformat()
@@ -387,7 +391,8 @@ async def run_scan_job():
 
         except Exception as e:
             logging.error(f"Erreur lors du traitement de {symbol} : {e}")
-            LAST_SCAN_LOGS["details"].append(f"❌ <b>{symbol}</b> : {e}")
+            safe_error = html.escape(str(e))
+            LAST_SCAN_LOGS["details"].append(f"❌ <b>{symbol}</b> : {safe_error}")
             continue
 
     save_all_state({"assets": STATE, "signal_state": SIGNAL_STATE})
