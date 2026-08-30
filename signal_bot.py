@@ -48,55 +48,40 @@ DEFAULT_ASSETS = {
     "XRP/USDT": {"enabled": True, "timeframe": "4h"},
 }
 
-# --- Persistance : liste des actifs suivis (table "state") ---
+# --- Persistance globale dans la table "state" ---
 
-def load_state():
+def load_all_state():
+    default_structure = {"assets": DEFAULT_ASSETS.copy(), "signal_state": {}}
     if not supabase:
-        return DEFAULT_ASSETS.copy()
+        return default_structure
     try:
         response = supabase.table("state").select("data").eq("id", 1).execute()
         if response.data and response.data[0].get("data"):
-            return response.data[0]["data"]
+            data = response.data[0]["data"]
+            # Rétrocompatibilité si la structure ancienne contenait seulement les actifs
+            if "assets" not in data:
+                return {"assets": data, "signal_state": {}}
+            return data
     except Exception as e:
         logging.error(f"Erreur chargement Supabase (state) : {e}")
-    return DEFAULT_ASSETS.copy()
+    return default_structure
 
-def save_state(state):
+def save_all_state(state_data):
     if not supabase:
         logging.error("Impossible de sauvegarder : Supabase non configuré.")
         return False
     try:
-        supabase.table("state").upsert({"id": 1, "data": state}).execute()
+        supabase.table("state").upsert({"id": 1, "data": state_data}).execute()
         return True
     except Exception as e:
         logging.error(f"Erreur sauvegarde Supabase (state) : {e}")
         return False
 
-# --- Persistance : anti-doublon des signaux (table "signal_state") ---
-
-def load_signal_state():
-    if not supabase:
-        return {}
-    try:
-        response = supabase.table("signal_state").select("data").eq("id", 1).execute()
-        if response.data and response.data[0].get("data"):
-            return response.data[0]["data"]
-    except Exception as e:
-        logging.error(f"Erreur chargement Supabase (signal_state) : {e}")
-    return {}
-
-def save_signal_state(state):
-    if not supabase:
-        return False
-    try:
-        supabase.table("signal_state").upsert({"id": 1, "data": state}).execute()
-        return True
-    except Exception as e:
-        logging.error(f"Erreur sauvegarde Supabase (signal_state) : {e}")
-        return False
-
 # --- État global ---
-STATE = load_state()
+FULL_STATE = load_all_state()
+STATE = FULL_STATE.get("assets", DEFAULT_ASSETS.copy())
+SIGNAL_STATE = FULL_STATE.get("signal_state", {})
+
 telegram_app = None
 LAST_SCAN_LOGS = {"timestamp": None, "details": [], "signals": []}
 
@@ -136,6 +121,13 @@ def _is_ip_ban_error(exception) -> bool:
     msg = str(exception)
     return "-1003" in msg or "banned until" in msg.lower() or " 418 " in f" {msg} "
 
+def _format_timeframe_for_exchange(exchange_id: str, timeframe: str) -> str:
+    # Bybit requiert '240' ou la valeur convertie pour le timeframe 4h
+    if exchange_id == "bybit":
+        mapping = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720", "1d": "D", "1w": "W"}
+        return mapping.get(timeframe, timeframe)
+    return timeframe
+
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     for exchange_id in EXCHANGE_FALLBACK_ORDER:
         exchange = _get_exchange_instance(exchange_id)
@@ -143,9 +135,10 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
             continue
         max_attempts = 2
         try:
+            ex_timeframe = _format_timeframe_for_exchange(exchange_id, timeframe)
             for attempt in range(max_attempts):
                 try:
-                    ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                    ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=ex_timeframe, limit=limit)
                     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                     df.attrs['source_exchange'] = exchange_id
@@ -297,7 +290,7 @@ def generate_signal_and_calc_rr(df):
 # --- Scan principal ---
 
 async def run_scan_job():
-    global LAST_SCAN_LOGS
+    global LAST_SCAN_LOGS, STATE, SIGNAL_STATE
     scan_time = datetime.utcnow()
     logging.info("Lancement de l'analyse des marchés...")
 
@@ -307,7 +300,6 @@ async def run_scan_job():
         "signals": []
     }
 
-    signal_state = load_signal_state()
     new_signals = []
 
     for symbol, config in list(STATE.items()):
@@ -327,13 +319,13 @@ async def run_scan_job():
             direction, reason, sl, tp, rr = generate_signal_and_calc_rr(df)
 
             curr = df.iloc[-1]
-            source = df.attrs.get('source_exchange', 'binance_vision')
+            source = df.attrs.get('source_exchange', 'bybit')
             source_note = "" if source == "binance_vision" else f" _(via {source}, secours)_"
             LAST_SCAN_LOGS["details"].append(f"**{symbol}** : {curr['close']} | {reason}{source_note}")
 
             if direction:
                 bar_time = curr['timestamp'].isoformat()
-                previous = signal_state.get(symbol, {})
+                previous = SIGNAL_STATE.get(symbol, {})
                 is_duplicate = previous.get("bar_time") == bar_time and previous.get("direction") == direction
 
                 if not is_duplicate:
@@ -342,7 +334,7 @@ async def run_scan_job():
                         "symbol": symbol, "direction": direction, "signal_type": signal_type,
                         "price": curr['close'], "sl": sl, "tp": tp, "rr": rr, "timeframe": timeframe
                     })
-                    signal_state[symbol] = {"bar_time": bar_time, "direction": direction}
+                    SIGNAL_STATE[symbol] = {"bar_time": bar_time, "direction": direction}
                 else:
                     LAST_SCAN_LOGS["details"][-1] += " (déjà notifié précédemment)"
 
@@ -351,7 +343,7 @@ async def run_scan_job():
             LAST_SCAN_LOGS["details"].append(f"❌ **{symbol}** : {e}")
             continue
 
-    save_signal_state(signal_state)
+    save_all_state({"assets": STATE, "signal_state": SIGNAL_STATE})
 
     if not (telegram_app and TELEGRAM_CHAT_ID):
         return
@@ -430,7 +422,7 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = args[0].upper()
     tf = args[1] if len(args) > 1 else "4h"
     STATE[symbol] = {"enabled": True, "timeframe": tf}
-    if save_state(STATE):
+    if save_all_state({"assets": STATE, "signal_state": SIGNAL_STATE}):
         await update.message.reply_text(f"✅ **{symbol}** ajouté à la liste (timeframe {tf}).", parse_mode="Markdown")
     else:
         await update.message.reply_text(f"⚠️ **{symbol}** ajouté localement, mais échec sauvegarde Supabase.", parse_mode="Markdown")
@@ -443,7 +435,7 @@ async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = args[0].upper()
     if symbol in STATE:
         del STATE[symbol]
-        if save_state(STATE):
+        if save_all_state({"assets": STATE, "signal_state": SIGNAL_STATE}):
             await update.message.reply_text(f"🗑️ **{symbol}** retiré de la liste de suivi.", parse_mode="Markdown")
         else:
             await update.message.reply_text(f"⚠️ **{symbol}** retiré localement, mais échec sauvegarde Supabase.", parse_mode="Markdown")
