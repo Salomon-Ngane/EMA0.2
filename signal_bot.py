@@ -128,6 +128,7 @@ def _format_timeframe_for_exchange(exchange_id: str, timeframe: str) -> str:
         return mapping.get(timeframe, timeframe)
     return timeframe
 
+
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     for exchange_id in EXCHANGE_FALLBACK_ORDER:
         exchange = _get_exchange_instance(exchange_id)
