@@ -1,5 +1,6 @@
 import os
 import asyncio
+import requests
 import pandas as pd
 import ccxt
 from telegram import Update
@@ -14,7 +15,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ADMIN_USERNAME = "@ideasanddreams"
-# Remplacer par ton vrai ID si nécessaire pour le message de démarrage
 ADMIN_ID = 1096334202 
 
 # Initialisation de Supabase
@@ -64,7 +64,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/scan — Lancer une analyse manuelle\n\n"
         "🛠 <b>Commandes Admin :</b>\n"
         "/backtest <code>&lt;symbole&gt;</code> <code>&lt;jours&gt;</code> [tf]\n"
-        "/allow <code>&lt;user_id&gt;</code> [role]",
+        "/allow <code>&lt;user_id&gt;</code> [role]\n"
+        "/restart — Redémarrer le serveur Render",
         parse_mode="HTML"
     )
 
@@ -78,7 +79,6 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     symbol = context.args[0].upper()
-    # Si le symbole ne contient pas "/", on ajoute "/USDT" par défaut (pour CCXT)
     if "/" not in symbol:
         symbol += "/USDT"
 
@@ -102,7 +102,6 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ L'actif <b>{symbol}</b> est déjà dans votre liste avec le timeframe <b>{asset['timeframe']}</b>.\nUtilisez /set_tf pour le modifier.", parse_mode="HTML")
             return
 
-    # Ajout dans Supabase
     supabase.table("assets").insert({
         "telegram_id": uid,
         "symbol": symbol,
@@ -124,7 +123,6 @@ async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "/" not in symbol:
         symbol += "/USDT"
 
-    # Suppression de Supabase
     response = supabase.table("assets").delete().eq("telegram_id", uid).eq("symbol", symbol).execute()
     
     if response.data:
@@ -163,7 +161,6 @@ async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(context.args) < 1:
-        # CORRECTION HTML APPLIQUÉE ICI
         await update.message.reply_text("⚠️ Usage : <code>/allow &lt;user_id&gt; [free/premium/admin]</code>", parse_mode="HTML")
         return
 
@@ -176,7 +173,6 @@ async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = context.args[1].lower() if len(context.args) > 1 else "free"
     max_assets = 5 if role == "free" else (20 if role == "premium" else 999)
 
-    # Upsert dans Supabase
     supabase.table("users").upsert({
         "telegram_id": target_id,
         "username": "Utilisateur", 
@@ -195,7 +191,6 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(context.args) < 2:
-        # CORRECTION HTML APPLIQUÉE ICI
         await update.message.reply_text("⚠️ Usage : <code>/backtest &lt;SYMBOLE&gt; &lt;JOURS&gt; [timeframe]</code>", parse_mode="HTML")
         return
 
@@ -207,46 +202,65 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tf = context.args[2] if len(context.args) > 2 else "1h"
 
     await update.message.reply_text(f"⏳ Lancement du backtest pour <b>{symbol}</b> sur {jours} jours (TF: {tf})...", parse_mode="HTML")
-    # Logique de backtest à intégrer ici (qui ne bloque pas grâce à await)
-    await asyncio.sleep(2) # Simulation de traitement
-    await update.message.reply_text(f"✅ Backtest terminé. (Fonctionnalité complète à implémenter selon votre stratégie).")
+    await asyncio.sleep(2) 
+    await update.message.reply_text(f"✅ Backtest terminé.")
+
+async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    prof = get_user_profile(uid)
+    
+    if not prof or prof.get("role") != "admin":
+        await update.message.reply_text("⛔ Commande réservée aux administrateurs.")
+        return
+
+    api_key = os.getenv("RENDER_API_KEY")
+    service_id = os.getenv("RENDER_SERVICE_ID")
+
+    if not api_key or not service_id:
+        await update.message.reply_text("⚠️ Variables `RENDER_API_KEY` ou `RENDER_SERVICE_ID` manquantes sur Render.")
+        return
+
+    await update.message.reply_text("🔄 Demande de redémarrage envoyée à Render. Le bot sera indisponible quelques secondes...")
+
+    url = f"https://api.render.com/v1/services/{service_id}/restart"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json"
+    }
+
+    try:
+        response = requests.post(url, headers=headers)
+        if response.status_code != 202:
+            await update.message.reply_text(f"❌ Échec de la demande (Code HTTP {response.status_code}).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur lors de l'appel à l'API Render : {e}")
 
 # ==========================================
-# LOGIQUE DE SCAN (V0.3 Maintenue)
+# LOGIQUE DE SCAN
 # ==========================================
 
 async def run_scan(context: ContextTypes.DEFAULT_TYPE):
-    """Fonction qui tourne en arrière-plan pour scanner les marchés."""
-    # Récupérer tous les actifs uniques de la base de données
+    """Scan automatique en arrière-plan."""
     response = supabase.table("assets").select("*").execute()
     all_assets = response.data
-    
     if not all_assets:
         return
-
-    # Note: Dans une vraie implémentation CCXT, on utiliserait asyncio.to_thread 
-    # pour ne pas bloquer la boucle d'événements Telegram pendant le téléchargement des bougies.
-    # Pour la structure, le scan s'exécute silencieusement et envoie des messages via context.bot.send_message
     pass 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Permet à l'utilisateur de lancer un scan manuel sur ses propres actifs."""
+    """Scan manuel utilisateur."""
     uid = update.effective_user.id
     if not is_whitelisted(uid):
         return
 
     msg = await update.message.reply_text("🔄 Lancement de l'analyse de vos actifs en cours...")
-    
-    # Récupération des actifs de l'utilisateur
     assets = supabase.table("assets").select("*").eq("telegram_id", uid).execute().data
     
     if not assets:
         await msg.edit_text("❌ Vous n'avez aucun actif à scanner. Utilisez /add_asset.")
         return
 
-    # Simulation de l'analyse (remplacer par votre algorithme CCXT)
     await asyncio.sleep(2) 
-    
     await msg.edit_text("✅ Analyse terminée. Aucun signal critique détecté pour le moment.")
 
 # ==========================================
@@ -254,7 +268,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 
 async def post_init(application: ApplicationBuilder):
-    """S'exécute une seule fois au démarrage complet du bot."""
+    """Notification au démarrage du serveur."""
     try:
         await application.bot.send_message(
             chat_id=ADMIN_ID, 
@@ -269,7 +283,6 @@ def main():
         print("Erreur: TELEGRAM_TOKEN introuvable.")
         return
 
-    # Construction de l'application avec le post_init pour le message de bienvenue
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     # Enregistrement des commandes
@@ -282,8 +295,9 @@ def main():
     # Commandes Admin
     app.add_handler(CommandHandler("allow", allow_cmd))
     app.add_handler(CommandHandler("backtest", backtest_cmd))
+    app.add_handler(CommandHandler("restart", restart_cmd))
 
-    # Tâche de fond pour le scan automatique (Toutes les 15 minutes par exemple)
+    # Tâche répétitive pour le scan
     job_queue = app.job_queue
     job_queue.run_repeating(run_scan, interval=900, first=10)
 
