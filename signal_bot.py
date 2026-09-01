@@ -377,21 +377,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prof = get_user_profile(uid)
     await update.message.reply_text(
-        f"👋 <b>Bienvenue dans le Bot Signal v0.4</b>\n\n"
+        f"👋 <b>Bienvenue dans le Bot Signal </b>\n\n"
         f"👤 <b>Statut :</b> {prof['role'].upper()}\n"
         f"📊 <b>Limite d'actifs :</b> {prof['max_assets']}\n\n"
         "📋 <b>Commandes :</b>\n"
         "/list — Voir vos actifs\n"
-        "/add_asset <symbole> [tf] — Ajouter un actif\n"
-        "/remove_asset <symbole> — Retirer un actif\n"
-        "/set_tf <tf> <symbole1> <symbole2>... — Modifier le timeframe\n"
+        "/add_asset <code>&lt;symbole&gt;</code> [tf] — Ajouter un actif\n"
+        "/remove_asset <code>&lt;symbole&gt;</code> — Retirer un actif\n"
+        "/set_tf <code>&lt;tf&gt;</code> <code>&lt;symbole1&gt;</code> <code>&lt;symbole2&gt;</code>... — Modifier le timeframe\n"
         "/scan — Lancer une analyse manuelle\n\n"
         "🛠 <b>Commandes Admin :</b>\n"
-        "/backtest <symbole> <jours> [tf]\n"
+        "/backtest <code>&lt;symbole&gt;</code> <code>&lt;jours&gt;</code> [tf]\n"
         "/top_scan [jours]\n"
-        "/allow <user_id> [role]",
+        "/allow <code>&lt;user_id&gt;</code> [role]",
         parse_mode="HTML"
     )
+
 
 async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin : Ajouter un utilisateur à la Whitelist."""
