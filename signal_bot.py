@@ -1,25 +1,39 @@
 import os
 import asyncio
+import logging
+import json
 import requests
 import pandas as pd
 import ccxt
 from collections import deque
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from aiohttp import web
+
+# ==========================================
+# CONFIGURATION & LOGGING
+# ==========================================
+
+logging.basicConfig(level=logging.INFO)
 
 # Charger les variables d'environnement
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN"))
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ADMIN_USERNAME = "@ideasanddreams"
-ADMIN_ID = 1096334202 
+ADMIN_ID = 1096334202
+PORT = int(os.getenv("PORT", 8080))
 
 # Initialisation de Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    logging.error(f"Erreur initialisation Supabase : {e}")
+    supabase = None
 
 # Initialisation de l'exchange (Binance par défaut)
 exchange = ccxt.binance({'enableRateLimit': True})
@@ -29,15 +43,74 @@ VALID_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 # Stockage en mémoire des signaux rejetés (RR < 2.7)
 REJECTED_LOGS = deque(maxlen=50)
 
+# Application Telegram globale
+telegram_app: Application = None
+
+# ==========================================
+# GESTION D'ÉTAT LOCAL & SUPABASE
+# ==========================================
+
+def load_global_state():
+    """Charge l'état depuis Supabase avec fallback sur state.json local."""
+    default_struct = {"user_assets": {}, "signal_state": {}}
+    
+    # Essayer Supabase d'abord
+    if supabase:
+        try:
+            res = supabase.table("state").select("data").eq("id", 1).execute()
+            if res.data and res.data[0].get("data"):
+                logging.info("État chargé depuis Supabase.")
+                return res.data[0]["data"]
+        except Exception as e:
+            logging.error(f"Erreur chargement state Supabase : {e}")
+    
+    # Fallback sur state.json local
+    if os.path.exists("state.json"):
+        try:
+            with open("state.json", "r", encoding="utf-8") as f:
+                logging.info("État chargé depuis state.json local.")
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Erreur chargement state.json local : {e}")
+            
+    logging.warning("Utilisation de l'état par défaut.")
+    return default_struct
+
+def save_global_state(state_data):
+    """Sauvegarde l'état localement et sur Supabase."""
+    # Sauvegarde locale systématique
+    try:
+        with open("state.json", "w", encoding="utf-8") as f:
+            json.dump(state_data, f, ensure_ascii=False, indent=2)
+        logging.info("État sauvegardé dans state.json local.")
+    except Exception as e:
+        logging.error(f"Erreur sauvegarde state.json local : {e}")
+
+    # Sauvegarde Supabase si configuré
+    if supabase:
+        try:
+            supabase.table("state").upsert({"id": 1, "data": state_data}).execute()
+            logging.info("État sauvegardé sur Supabase.")
+            return True
+        except Exception as e:
+            logging.error(f"Erreur sauvegarde state Supabase : {e}")
+            return False
+    return True
+
 # ==========================================
 # FONCTIONS UTILITAIRES & INDICATEURS
 # ==========================================
 
 def get_user_profile(telegram_id):
     """Récupère le profil utilisateur depuis Supabase."""
-    response = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
-    if response.data:
-        return response.data[0]
+    if not supabase:
+        return None
+    try:
+        response = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
+        if response.data:
+            return response.data[0]
+    except Exception as e:
+        logging.error(f"Erreur récupération profil {telegram_id} : {e}")
     return None
 
 def is_whitelisted(telegram_id):
@@ -149,6 +222,14 @@ def analyze_market(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
     return {"status": "NONE", "msg": "⚪ Neutre (Structure non alignée)"}
 
 # ==========================================
+# SERVEUR HEALTH CHECK
+# ==========================================
+
+async def handle_health(request):
+    """Endpoint pour les health checks."""
+    return web.Response(text="OK", status=200)
+
+# ==========================================
 # COMMANDES UTILISATEUR
 # ==========================================
 
@@ -205,6 +286,12 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tf = args.pop(-1).lower()
 
     prof = get_user_profile(uid)
+    if not prof:
+        return await update.message.reply_text("❌ Profil utilisateur non trouvé.")
+    
+    if not supabase:
+        return await update.message.reply_text("❌ Supabase non configuré.")
+    
     current_assets = supabase.table("assets").select("*").eq("telegram_id", uid).execute().data
     existing_symbols = [a['symbol'] for a in current_assets]
 
@@ -232,6 +319,9 @@ async def remove_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         return await update.message.reply_text("⚠️ Usage: <code>/remove_asset &lt;symbole&gt;</code>", parse_mode="HTML")
 
+    if not supabase:
+        return
+
     removed = []
     for raw_symbol in context.args:
         symbol = raw_symbol.upper() if "/" in raw_symbol.upper() else f"{raw_symbol.upper()}/USDT"
@@ -249,6 +339,9 @@ async def set_tf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tf not in VALID_TIMEFRAMES:
         return await update.message.reply_text(f"❌ Timeframe invalide.")
 
+    if not supabase:
+        return
+
     updated = []
     for raw_symbol in context.args[1:]:
         symbol = raw_symbol.upper() if "/" in raw_symbol.upper() else f"{raw_symbol.upper()}/USDT"
@@ -262,6 +355,9 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_whitelisted(uid):
         return
 
+    if not supabase:
+        return await update.message.reply_text("❌ Supabase non configuré.")
+
     assets = supabase.table("assets").select("*").eq("telegram_id", uid).execute().data
     if not assets:
         return await update.message.reply_text("📭 Liste vide.")
@@ -273,6 +369,9 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_whitelisted(uid):
         return
+
+    if not supabase:
+        return await update.message.reply_text("❌ Supabase non configuré.")
 
     msg = await update.message.reply_text("🔄 Analyse en cours (Stratégie Pro)...")
     assets = supabase.table("assets").select("*").eq("telegram_id", uid).execute().data
@@ -286,7 +385,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             results.append(f"⚠️ <b>{a['symbol']}</b> : Erreur ({e})")
 
-    await msg.edit_text("\n\n".join(results), parse_mode="HTML")
+    await msg.edit_text("\n\n".join(results) if results else "❌ Pas de données.", parse_mode="HTML")
 
 # ==========================================
 # COMMANDES ADMIN & BACKTEST
@@ -354,69 +453,132 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Erreur : {e}")
 
 async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Même logique qu'avant
     uid = update.effective_user.id
     prof = get_user_profile(uid)
-    if not prof or prof.get("role") != "admin": return
-    if len(context.args) < 1: return
+    if not prof or prof.get("role") != "admin": 
+        return
+    if not context.args or not supabase: 
+        return
+    
     target_id, role = int(context.args[0]), context.args[1].lower() if len(context.args) > 1 else "free"
     max_as = 5 if role == "free" else (20 if role == "premium" else 999)
     supabase.table("users").upsert({"telegram_id": target_id, "username": "User", "role": role, "max_assets": max_as}).execute()
     await update.message.reply_text(f"✅ Rôle {role} appliqué à {target_id}.")
 
 async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Même logique qu'avant
-    if get_user_profile(update.effective_user.id).get("role") != "admin": return
-    requests.post(f"https://api.render.com/v1/services/{os.getenv('RENDER_SERVICE_ID')}/restart", headers={"Authorization": f"Bearer {os.getenv('RENDER_API_KEY')}"})
-    await update.message.reply_text("🔄 Redémarrage Render lancé.")
+    prof = get_user_profile(update.effective_user.id)
+    if not prof or prof.get("role") != "admin": 
+        return
+    
+    service_id = os.getenv('RENDER_SERVICE_ID')
+    api_key = os.getenv('RENDER_API_KEY')
+    
+    if not service_id or not api_key:
+        return await update.message.reply_text("❌ Variables Render non configurées.")
+    
+    try:
+        requests.post(f"https://api.render.com/v1/services/{service_id}/restart", 
+                     headers={"Authorization": f"Bearer {api_key}"})
+        await update.message.reply_text("🔄 Redémarrage Render lancé.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur redémarrage : {e}")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Placeholder pour les callback queries."""
+    pass
 
 # ==========================================
 # SCAN AUTOMATIQUE D'ARRIÈRE-PLAN
 # ==========================================
 
-async def run_scan(context: ContextTypes.DEFAULT_TYPE):
-    assets = supabase.table("assets").select("*").execute().data
-    if not assets: return
-
-    for asset in assets:
-        try:
-            df = await asyncio.to_thread(fetch_ohlcv_sync, asset['symbol'], asset['timeframe'], 150)
-            diag = analyze_market(df, asset['symbol'], asset['timeframe'])
-            
-            if diag["status"] == "SIGNAL":
-                await context.bot.send_message(
-                    chat_id=asset['telegram_id'],
-                    text=f"🔔 <b>ALERTE {asset['symbol']}</b> ({asset['timeframe']})\n\n{diag['msg']}",
-                    parse_mode="HTML"
-                )
-        except Exception as e:
-            print(f"Erreur background {asset['symbol']}: {e}")
-
-# ==========================================
-# DÉMARRAGE ET MAIN
-# ==========================================
-
-async def post_init(application: ApplicationBuilder):
-    try: await application.bot.send_message(chat_id=ADMIN_ID, text="✅ <b>Bot Signal V0.4 (Pro) En Ligne.</b>", parse_mode="HTML")
-    except: pass
-
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("add_asset", add_asset_cmd))
-    app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
-    app.add_handler(CommandHandler("set_tf", set_tf_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("logs", logs_cmd))
+async def run_scan_job():
+    """Job de scan automatique asynchrone."""
+    if not supabase:
+        logging.warning("Supabase non configuré, scan désactivé.")
+        return
     
-    app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler("backtest", backtest_cmd))
-    app.add_handler(CommandHandler("restart", restart_cmd))
+    while True:
+        try:
+            assets = supabase.table("assets").select("*").execute().data
+            if not assets:
+                await asyncio.sleep(900)
+                continue
 
-    app.job_queue.run_repeating(run_scan, interval=900, first=30)
-    app.run_polling()
+            for asset in assets:
+                try:
+                    df = await asyncio.to_thread(fetch_ohlcv_sync, asset['symbol'], asset['timeframe'], 150)
+                    diag = analyze_market(df, asset['symbol'], asset['timeframe'])
+                    
+                    if diag["status"] == "SIGNAL":
+                        await telegram_app.bot.send_message(
+                            chat_id=asset['telegram_id'],
+                            text=f"🔔 <b>ALERTE {asset['symbol']}</b> ({asset['timeframe']})\n\n{diag['msg']}",
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    logging.error(f"Erreur scan {asset['symbol']}: {e}")
+            
+            await asyncio.sleep(900)  # 15 minutes
+        except Exception as e:
+            logging.error(f"Erreur run_scan_job : {e}")
+            await asyncio.sleep(300)  # Retry après 5 minutes
+
+# ==========================================
+# DÉMARRAGE & MAIN
+# ==========================================
+
+async def post_init(application: Application):
+    """Fonction appelée après l'initialisation de l'application."""
+    try:
+        await application.bot.send_message(chat_id=ADMIN_ID, text="✅ <b>Bot Signal V0.4 (Pro) En Ligne.</b>", parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"Impossible d'envoyer message de démarrage : {e}")
+
+async def main():
+    """Main asynchrone avec serveur HTTP pour health checks."""
+    global telegram_app
+    
+    # Démarrer le serveur HTTP
+    server = web.Application()
+    server.router.add_get('/', handle_health)
+    server.router.add_get('/health', handle_health)
+
+    runner = web.AppRunner(server)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    logging.info(f"Serveur HTTP démarré sur le port {PORT}")
+
+    if not TELEGRAM_TOKEN:
+        logging.error("TELEGRAM_BOT_TOKEN manquant.")
+        return
+
+    # Initialiser et démarrer le bot Telegram
+    telegram_app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    
+    # Ajouter les handlers
+    telegram_app.add_handler(CommandHandler("start", start_cmd))
+    telegram_app.add_handler(CommandHandler("allow", allow_cmd))
+    telegram_app.add_handler(CommandHandler("list", list_cmd))
+    telegram_app.add_handler(CommandHandler("add_asset", add_asset_cmd))
+    telegram_app.add_handler(CommandHandler("remove_asset", remove_asset_cmd))
+    telegram_app.add_handler(CommandHandler("set_tf", set_tf_cmd))
+    telegram_app.add_handler(CommandHandler("backtest", backtest_cmd))
+    telegram_app.add_handler(CommandHandler("scan", scan_cmd))
+    telegram_app.add_handler(CommandHandler("logs", logs_cmd))
+    telegram_app.add_handler(CommandHandler("restart", restart_cmd))
+    telegram_app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Initialisation propre pour v20+
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(drop_pending_updates=True)
+    logging.info("Bot Telegram v0.4 démarré avec succès.")
+
+    # Lancer le job de scan asynchrone
+    asyncio.create_task(run_scan_job())
+    
+    # Garder le bot en vie
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
