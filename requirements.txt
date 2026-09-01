@@ -1,8 +1,9 @@
 python-telegram-bot>=20.0
+python-dotenv>=1.0.0
 websockets>=10.0
 ccxt
 pandas>=2.0.0
 ta
 supabase
-aiohttp
+aiohttp>=3.8.0
 requests>=2.31.0
