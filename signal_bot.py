@@ -2,10 +2,11 @@ import os
 import asyncio
 import logging
 import json
+import requests
 import pandas as pd
-import ccxt.async_support as ccxt  # Utilisation de la version asynchrone de CCXT
+import ccxt.async_support as ccxt
 from collections import deque
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -36,7 +37,7 @@ except Exception as e:
     logging.error(f"Erreur initialisation Supabase : {e}")
     supabase = None
 
-# Initialisation de l'exchange (BYBIT remplace BINANCE)
+# Initialisation de l'exchange
 exchange = ccxt.bybit({'enableRateLimit': True})
 
 VALID_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
@@ -52,7 +53,6 @@ async def supabase_execute(query):
     if not supabase:
         return None
     try:
-        # Offload la requête HTTP synchrone dans un thread séparé
         res = await asyncio.to_thread(query.execute)
         return res
     except Exception as e:
@@ -60,9 +60,8 @@ async def supabase_execute(query):
         return None
 
 def format_symbol(raw_symbol):
-    """Gère le formatage crypto (ajout de /USDT) et respecte les indices Deriv."""
+    """Gère le formatage crypto et respecte les indices Deriv."""
     s = raw_symbol.upper().strip()
-    # Identification rudimentaire des indices Deriv pour éviter d'ajouter /USDT
     if any(x in s for x in ["VOL", "R_", "100", "75", "50", "25", "10", "BOOM", "CRASH"]):
         return s
     if "/" not in s:
@@ -80,54 +79,41 @@ async def get_user_profile(telegram_id):
 # ==========================================
 
 async def fetch_ohlcv_async(symbol: str, timeframe: str, limit: int = 150) -> pd.DataFrame:
-    """Récupère les données CCXT en asynchrone."""
-    # Note: CCXT Bybit va lever une erreur si on tente de fetch un actif Deriv (ex: R_100)
     if "VOL" in symbol or "R_" in symbol or "BOOM" in symbol or "CRASH" in symbol:
-        raise ValueError("Actif Deriv détecté. Nécessite l'intégration de l'API Deriv (non géré par Bybit/CCXT).")
+        raise ValueError("Actif Deriv détecté. API Bybit ignorée pour ce symbole.")
         
     ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['EMA10'] = df['close'].ewm(span=10, adjust=False).mean()  # Verte
-    df['SMA35'] = df['close'].rolling(window=35).mean()          # Rouge
-    df['EMA55'] = df['close'].ewm(span=55, adjust=False).mean()  # Jaune
+    df['EMA10'] = df['close'].ewm(span=10, adjust=False).mean()  
+    df['SMA35'] = df['close'].rolling(window=35).mean()          
+    df['EMA55'] = df['close'].ewm(span=55, adjust=False).mean()  
     return df
 
 def get_last_pivot(df: pd.DataFrame, current_idx: int, window: int = 10, kind: str = "HIGH", condition: str = "NONE"):
-    """
-    Recherche un pivot validé dans le passé.
-    On recule de 'window' bougies pour être sûr que le pivot a pu être confirmé par son futur.
-    """
     search_start = current_idx - window
     
     for p in range(search_start, window, -1):
         is_pivot = True
-        
-        # Vérification symétrique (gauche et droite du point p)
         for j in range(1, window + 1):
             if kind == "HIGH":
                 if df['high'].iloc[p] <= df['high'].iloc[p - j] or df['high'].iloc[p] <= df['high'].iloc[p + j]:
                     is_pivot = False
                     break
-            else: # LOW
+            else: 
                 if df['low'].iloc[p] >= df['low'].iloc[p - j] or df['low'].iloc[p] >= df['low'].iloc[p + j]:
                     is_pivot = False
                     break
         
         if is_pivot:
             if condition == "BELOW_EMAS":
-                if (df['low'].iloc[p] < df['EMA10'].iloc[p] and 
-                    df['low'].iloc[p] < df['SMA35'].iloc[p] and 
-                    df['low'].iloc[p] < df['EMA55'].iloc[p]):
+                if (df['low'].iloc[p] < df['EMA10'].iloc[p] and df['low'].iloc[p] < df['SMA35'].iloc[p] and df['low'].iloc[p] < df['EMA55'].iloc[p]):
                     return df['low'].iloc[p]
             elif condition == "ABOVE_EMAS":
-                if (df['high'].iloc[p] > df['EMA10'].iloc[p] and 
-                    df['high'].iloc[p] > df['SMA35'].iloc[p] and 
-                    df['high'].iloc[p] > df['EMA55'].iloc[p]):
+                if (df['high'].iloc[p] > df['EMA10'].iloc[p] and df['high'].iloc[p] > df['SMA35'].iloc[p] and df['high'].iloc[p] > df['EMA55'].iloc[p]):
                     return df['high'].iloc[p]
             else:
                 return df['high'].iloc[p] if kind == "HIGH" else df['low'].iloc[p]
     
-    # Fallback sécurisé
     lookback_start = max(0, current_idx - 50)
     return df['high'].iloc[lookback_start:current_idx].max() if kind == "HIGH" else df['low'].iloc[lookback_start:current_idx].min()
 
@@ -135,7 +121,6 @@ def analyze_market(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
     if len(df) < 60:
         return {"status": "NONE", "msg": "⚪ Historique insuffisant"}
     
-    # BOUGIE CLÔTURÉE UNIQUEMENT (-2)
     i = len(df) - 2
     last = df.iloc[i]
     prev = df.iloc[i-1]
@@ -145,7 +130,6 @@ def analyze_market(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
     ema55, prev_ema55 = last['EMA55'], prev['EMA55']
     close = last['close']
     
-    # CASSURE
     long_signal = (prev_ema10 <= prev_sma35) and (ema10 > sma35) and (ema10 > ema55)
     short_signal = (prev_ema10 >= prev_sma35) and (ema10 < sma35) and (ema10 < ema55)
     
@@ -173,7 +157,6 @@ def analyze_market(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
                 REJECTED_LOGS.appendleft(f"[{symbol} {timeframe}] VENTE rejetée | R:R = {rr:.2f} (TP={tp:.2f}, SL={sl:.2f})")
                 return {"status": "NONE", "msg": f"🔴 Tendance Baissière (Signal écarté R:R={rr:.2f})"}
 
-    # RETEST
     if ema10 > sma35 and ema10 > ema55:
         recent_cross = any((df['EMA10'].iloc[k-1] <= df['SMA35'].iloc[k-1] and df['EMA10'].iloc[k] > df['SMA35'].iloc[k]) for k in range(i, max(0, i - 15), -1))
         if recent_cross and last['low'] <= ema10 and prev['low'] > prev['EMA10'] and close > sma35 and close > ema55:
@@ -196,31 +179,87 @@ async def handle_health(request):
     return web.Response(text="OK", status=200)
 
 # ==========================================
-# COMMANDES UTILISATEUR
+# COMMANDES UTILISATEUR & GESTION D'ACCÈS
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    username = update.effective_user.username or "SansPseudo"
     prof = await get_user_profile(uid)
+    
+    # 1. Utilisateur inconnu -> Notification Admin
     if not prof:
-        await update.message.reply_text(f"⛔ <b>Accès restreint.</b>\nContactez l'admin : {ADMIN_USERNAME}", parse_mode="HTML")
+        await update.message.reply_text("⛔ <b>Accès restreint.</b>\nVotre demande a été envoyée à l'administrateur.", parse_mode="HTML")
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Approuver (Free)", callback_data=f"allow_{uid}_free_{username}")],
+            [InlineKeyboardButton("🌟 Approuver (Premium)", callback_data=f"allow_{uid}_premium_{username}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        admin_msg = f"🔔 <b>Nouvel Utilisateur en attente</b>\n\n👤 <b>ID:</b> <code>{uid}</code>\n🔖 <b>Pseudo:</b> @{username}\n\nApprouvez l'accès :"
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=admin_msg, reply_markup=reply_markup, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Erreur envoi notification admin : {e}")
         return
 
-    await update.message.reply_text(
-        f"👋 <b>Bienvenue dans le Bot Signal v0.5 (Pro Bybit)</b>\n\n"
-        f"👤 <b>Statut :</b> {prof['role'].upper()}\n\n"
-        "📋 <b>Commandes Utilisateur :</b>\n"
+    # 2. Utilisateur validé -> Menu Complet
+    role = prof.get('role', 'free').upper()
+    max_assets = prof.get('max_assets', 5)
+
+    msg_text = (
+        f"👋 <b>Bienvenue dans le Bot Signal</b>\n\n"
+        f"👤 <b>Statut :</b> {role}\n"
+        f"📊 <b>Limite d'actifs :</b> {max_assets}\n\n"
+        "📋 <b>Commandes :</b>\n"
         "/list — Voir vos actifs\n"
-        "/add_asset <code>&lt;sym1&gt; [sym2...] [tf]</code>\n"
-        "/remove_asset <code>&lt;sym1&gt; [sym2...]</code>\n"
-        "/set_tf <code>&lt;tf&gt; &lt;sym1&gt; [sym2...]</code>\n"
+        "/add_asset <code>&lt;symbole&gt; [tf]</code> — Ajouter un actif\n"
+        "/remove_asset <code>&lt;symbole&gt;</code> — Retirer un actif\n"
+        "/set_tf <code>&lt;tf&gt; &lt;symbole1&gt; &lt;symbole2&gt;...</code> — Modifier le timeframe\n"
         "/scan — Lancer une analyse manuelle\n"
         "/logs — Voir les setups ignorés (R:R < 2.7)\n\n"
         "🛠 <b>Commandes Admin :</b>\n"
         "/backtest <code>&lt;symbole&gt; &lt;jours&gt; [tf]</code>\n"
-        "/allow <code>&lt;id&gt; [role]</code>",
-        parse_mode="HTML"
+        "/top_scan <code>[jours]</code>\n"
+        "/allow <code>&lt;user_id&gt; [role]</code> — Approuver/Modifier un rôle\n"
+        "/restart — Redémarrer le service sur render"
     )
+    
+    await update.message.reply_text(msg_text, parse_mode="HTML")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le clic sur les boutons de notification Admin."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if data.startswith("allow_"):
+        parts = data.split("_")
+        if len(parts) >= 3:
+            target_id = int(parts[1])
+            role = parts[2]
+            target_username = parts[3] if len(parts) > 3 else "User"
+            
+            # Application des limites
+            max_as = 5 if role == "free" else (20 if role == "premium" else 999)
+            
+            # Enregistrement base de données
+            await supabase_execute(supabase.table("users").upsert({
+                "telegram_id": target_id, 
+                "username": target_username, 
+                "role": role, 
+                "max_assets": max_as
+            }))
+            
+            # Mise à jour du message de l'admin
+            await query.edit_message_text(f"✅ Utilisateur <code>{target_id}</code> (@{target_username}) approuvé avec succès en tant que <b>{role.upper()}</b>.", parse_mode="HTML")
+            
+            # Notification à l'utilisateur
+            try:
+                await context.bot.send_message(chat_id=target_id, text="🎉 <b>Votre accès a été approuvé !</b>\nTapez /start pour voir le menu complet.", parse_mode="HTML")
+            except Exception as e:
+                logging.error(f"Impossible de notifier l'utilisateur {target_id} : {e}")
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await get_user_profile(update.effective_user.id): return
@@ -242,7 +281,6 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = list(context.args)
     tf = "1h"
-    # Vérifie si le dernier argument est un timeframe
     if args[-1].lower() in VALID_TIMEFRAMES:
         tf = args.pop(-1).lower()
 
@@ -253,14 +291,11 @@ async def add_asset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added, errors = [], []
     for raw_symbol in args:
         symbol = format_symbol(raw_symbol)
-
         if len(current_assets) + len(added) >= prof['max_assets']:
             errors.append(f"⛔ Limite atteinte ({prof['max_assets']}) à partir de {symbol}.")
             break
-
         if symbol in existing_symbols or symbol in added:
             continue
-
         await supabase_execute(supabase.table("assets").insert({"telegram_id": uid, "symbol": symbol, "timeframe": tf}))
         added.append(symbol)
 
@@ -341,7 +376,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     prof = await get_user_profile(uid)
     if not prof or prof.get("role") != "admin" or len(context.args) < 2:
-        return await update.message.reply_text("⚠️ /backtest <SYMBOLE> <JOURS> [tf]")
+        return await update.message.reply_text("⚠️ Usage: /backtest <SYMBOLE> <JOURS> [tf]")
 
     symbol = format_symbol(context.args[0])
     jours = int(context.args[1])
@@ -356,7 +391,6 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = await fetch_ohlcv_async(symbol, tf, limit)
         trades, wins = 0, 0
 
-        # Toujours -2 pour simuler le comportement réel (bougie clôturée)
         for i in range(100, len(df) - 2):
             ema10, p_ema10 = df['EMA10'].iloc[i], df['EMA10'].iloc[i-1]
             sma35, p_sma35 = df['SMA35'].iloc[i], df['SMA35'].iloc[i-1]
@@ -372,12 +406,10 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if tp > close and sl < close and (tp - close) / (close - sl) >= 2.7:
                     trades += 1
                     for j in range(i+1, min(i+50, len(df))):
-                        # Logique Intra-bougie
                         if df['high'].iloc[j] >= tp and df['low'].iloc[j] <= sl:
-                            # Les deux touchés: on vérifie qui est le plus proche de l'Open
                             open_price = df['open'].iloc[j]
                             if abs(tp - open_price) < abs(open_price - sl):
-                                wins += 1 # TP touché en premier
+                                wins += 1
                             break
                         elif df['high'].iloc[j] >= tp: 
                             wins += 1; break
@@ -410,6 +442,13 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Erreur Bybit : {e}")
 
+async def top_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    prof = await get_user_profile(uid)
+    if not prof or prof.get("role") != "admin": return
+    # Placeholder command
+    await update.message.reply_text("🚧 La commande /top_scan est en cours de développement.")
+
 async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     prof = await get_user_profile(uid)
@@ -420,10 +459,26 @@ async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = context.args[1].lower() if len(context.args) > 1 else "free"
     max_as = 5 if role == "free" else (20 if role == "premium" else 999)
     await supabase_execute(supabase.table("users").upsert({"telegram_id": target_id, "username": "User", "role": role, "max_assets": max_as}))
-    await update.message.reply_text(f"✅ Rôle {role} appliqué à {target_id}.")
+    await update.message.reply_text(f"✅ Rôle {role} appliqué manuellement à {target_id}.")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pass
+async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    prof = await get_user_profile(uid)
+    if not prof or prof.get("role") != "admin": return
+    
+    service_id = os.getenv('RENDER_SERVICE_ID')
+    api_key = os.getenv('RENDER_API_KEY')
+    
+    if not service_id or not api_key:
+        return await update.message.reply_text("❌ Variables Render non configurées (RENDER_SERVICE_ID, RENDER_API_KEY).")
+    
+    try:
+        requests.post(f"https://api.render.com/v1/services/{service_id}/restart", 
+                     headers={"Authorization": f"Bearer {api_key}"})
+        await update.message.reply_text("🔄 Redémarrage du serveur Render lancé avec succès.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur redémarrage : {e}")
+
 
 # ==========================================
 # SCAN AUTOMATIQUE D'ARRIÈRE-PLAN
@@ -452,11 +507,11 @@ async def run_scan_job():
                             parse_mode="HTML"
                         )
                 except ValueError:
-                    pass # Silencieux pour les actifs Deriv non supportés par l'API
+                    pass 
                 except Exception as e:
                     logging.error(f"Erreur scan {asset['symbol']}: {e}")
             
-            await asyncio.sleep(900)  # 15 minutes
+            await asyncio.sleep(900)
         except Exception as e:
             logging.error(f"Erreur run_scan_job : {e}")
             await asyncio.sleep(300)
@@ -467,7 +522,7 @@ async def run_scan_job():
 
 async def post_init(application: Application):
     try:
-        await application.bot.send_message(chat_id=ADMIN_ID, text="✅ <b>Bot Signal V0.5 (Pro) En Ligne.</b>", parse_mode="HTML")
+        await application.bot.send_message(chat_id=ADMIN_ID, text="✅ <b>Bot Signal V0.5 En Ligne.</b>", parse_mode="HTML")
     except Exception as e:
         logging.warning(f"Impossible d'envoyer message de démarrage : {e}")
 
@@ -497,6 +552,8 @@ async def main():
     telegram_app.add_handler(CommandHandler("backtest", backtest_cmd))
     telegram_app.add_handler(CommandHandler("scan", scan_cmd))
     telegram_app.add_handler(CommandHandler("logs", logs_cmd))
+    telegram_app.add_handler(CommandHandler("top_scan", top_scan_cmd))
+    telegram_app.add_handler(CommandHandler("restart", restart_cmd))
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
 
     await telegram_app.initialize()
