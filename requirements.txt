@@ -1,0 +1,7 @@
+python-telegram-bot>=20.0
+supabase
+pandas
+ccxt
+aiohttp
+python-dotenv
+websockets
