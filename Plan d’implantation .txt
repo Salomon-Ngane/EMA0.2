@@ -1,0 +1,2469 @@
+ Plan d’implementation de tout un chacun.
+Backtest agent: 
+{Voici mon plan d'implémentation détaillé pour le moteur de backtest, rédigé en stricte conformité avec la spécification technique EMA0.3 et les directives de collaboration inter-agents.
+1. État actuel
+	•	Ce qui existe : Le backtest d'EMA0.2 est fonctionnel mais rudimentaire. Il est principalement limité à l'évaluation des crossovers et ne gère pas finement la réalité de l'exécution.
+	•	Ce qui fonctionne : L'itération basique sur des données de prix pour vérifier si un TP ou un SL est touché.
+	•	Ce qui doit être conservé : L'utilisation d'un dataset historique (Golden Dataset) pour valider les comportements.
+2. Problèmes identifiés
+	•	Limitations majeures : Le simulateur actuel ignore le slippage, les frais de transaction, et l'expiration des trades dans le temps.
+	•	Dette technique (Risque de duplication) : Le backtester d'EMA0.2 risque de réimplémenter sa propre logique de calcul des EMA ou des retests, ce qui viole le principe fondamental d'EMA0.3 ("Single Strategy Source of Truth").
+	•	Bugs potentiels (Ambiguïté) : Il n'y a pas de gestion formelle documentée lorsqu'une bougie touche à la fois le Stop Loss et le Take Profit.
+3. Architecture cible
+	•	Structure des modules : Le module backtest/ consomme les données du module market/ et les signaux du module strategy/ pour simuler l'exécution.
+	•	Responsabilités : Construire le grand livre des transactions (Trade Ledger) de manière réaliste (frais, slippage, expiration) et calculer les métriques de performance brutes.
+	•	Interfaces inter-agents :
+	•	Je dépends du STRATEGY AGENT pour recevoir des objets SignalSetup purs.
+	•	Le VALIDATION AGENT dépend de moi pour recevoir le Trade Ledger (liste d'objets BacktestTrade) afin d'exécuter ses analyses Monte Carlo et Walk-Forward.
+4. Fichiers
+	•	Fichiers à créer/modifier dans backtest/ :
+	•	execution.py : Logique de simulation (touché du TP/SL, politique WORST_CASE, frais, slippage, expiration à 50 bougies).
+	•	portfolio.py : Moteur de calcul de la taille de position (risque de 1% par trade, un seul trade actif par paire/timeframe).
+	•	metrics.py : Calculateur d'expectancy, drawdown, R net, profit factor, etc..
+	•	engine.py : L'orchestrateur qui relie Dataset -> Strategy -> Execution -> Portfolio -> Metrics.
+	•	reports.py : Formatage des résultats bruts.
+	•	Fichiers exclus : Je ne modifierai pas walkforward.py ni monte_carlo.py, qui relèvent du domaine exclusif du VALIDATION AGENT.
+5. Interfaces (Contrats)
+	•	Entrées : MarketData (du MARKET AGENT) et SignalSetup (du STRATEGY AGENT).
+	•	Modèle BacktestTrade (Contrat critique pour le VALIDATION AGENT) :# Contrat d'interface proposé pour validation
+	•	class BacktestTrade:
+	•	    entry_time: datetime
+	•	    exit_time: datetime
+	•	    symbol: str
+	•	    timeframe: str
+	•	    direction: str # LONG/SHORT
+	•	    entry_price: float
+	•	    exit_price: float
+	•	    stop_loss: float
+	•	    take_profit: float
+	•	    result: str # WIN/LOSS/EXPIRED
+	•	    r_multiple: float
+	•	    gross_pnl: float
+	•	    fees: float
+	•	    slippage: float
+	•	    net_pnl: float
+	•	    exit_reason: str # TP/SL/EXPIRATION
+	•	 
+	•	Sorties : Un rapport contenant les métriques complètes et une liste List[BacktestTrade].
+6. Dépendances
+	•	Existantes à conserver : pandas et numpy pour l'itération et le calcul vectoriel des courbes d'équité.
+	•	Nouvelles dépendances : Aucune nouvelle dépendance externe n'est requise. Je dépendrai en interne des contrats établis par market.models et strategy.setup.
+7. Tests
+	•	Fixtures : Utilisation d'un sous-ensemble déterministe (ex: tests/fixtures/btc_sample_15m.csv) pour figer les résultats.
+	•	Tests unitaires :
+	•	Vérification stricte de la politique WORST_CASE sur les bougies ambiguës.
+	•	Vérification de la clôture exacte après 50 bougies (max_bars_in_trade = 50).
+	•	Vérification du calcul du position sizing (1% de risque).
+	•	Tests d'intégration : S'assurer que le pipeline génère un TradeLedger exploitable sans erreur de typage.
+8. Risques
+	•	Risque technique : Lenteur d'exécution si l'itération des bougies dans execution.py n'est pas optimisée (boucles for en Python natif sur de larges DataFrames).
+	•	Dépendance bloquante : Si le STRATEGY AGENT modifie le format de SignalSetup sans prévenir, le moteur plantera.
+	•	Risque de régression : Divergence entre le calcul de performance EMA0.2 et EMA0.3 due à l'introduction des frais et du slippage.
+9. ARCHITECTURAL DECISION REQUIRED (ADR)
+Les points suivants nécessitent une validation avant implémentation :
+	•	ADR-Backtest-001 : Politique de prix sur expiration. La spécification exige l'expiration après 50 bougies mais stipule que "The exit price policy must be explicitly documented". Hypothèse proposée : Si un trade expire à la 50ème bougie, nous sortons au prix de Clôture (Close) de cette 50ème bougie.
+	•	ADR-Backtest-002 : Arrondis de taille de position. Comment le portfolio.py gère-t-il la taille de position pour des actifs ayant des tailles de lot différentes (ex: BTC vs SHIB) ? Hypothèse proposée : Pour la simulation, on utilise des tailles de position flottantes exactes sans contrainte de lot d'exchange.
+10. Ordre d'implémentation
+	1.	Définition des contrats : Rédiger et geler les classes de données (BacktestTrade, PortfolioConfig).
+	2.	Fixtures : Créer un faux flux MarketData et une liste de SignalSetup factices pour isoler mes tests.
+	3.	Module d'Exécution : Coder execution.py (gestion de TP, SL, ambiguïté WORST_CASE, expiration, slippage, frais).
+	4.	Module Portfolio : Coder portfolio.py (taille de position et limite d'un trade actif par paire).
+	5.	Module Métriques : Coder metrics.py (Expectancy, Max DD, R Net, Equity Curve).
+	6.	Intégration : Relier le tout dans engine.py.
+	7.	Tests : Rédiger la suite de tests unitaires pour le simulateur d'exécution.
+11. Critères d'acceptation
+Le travail sera considéré comme terminé ("Done") quand :
+	•	Le moteur consomme SignalSetup sans recalculer d'indicateurs EMA.
+	•	La gestion de l'expiration (50 bougies) et la politique WORST_CASE sont implémentées et prouvées par des tests unitaires.
+	•	Les frais et le slippage sont déductibles et paramétrables.
+	•	Les métriques obligatoires (expectancy, profit factor, drawdown, net R, etc.) sont générées avec succès.
+	•	L'objet BacktestTrade est transmis sans erreur aux outils du VALIDATION AGENT.
+12. Handoff
+Ce que les autres agents doivent savoir :
+	•	Au VALIDATION AGENT : Confirme si la structure BacktestTrade proposée dans la section 5 répond parfaitement à tes besoins pour coder monte_carlo.py et walkforward.py.
+	•	Au STRATEGY AGENT : J'ai besoin de la structure exacte de ton objet SignalSetup pour finaliser mon interface d'entrée.
+	•	À l'ARCHITECTE : J'attends une réponse sur l'ADR-Backtest-001 et ADR-Backtest-002.
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW}
+
+Validation agent:{Voici mon plan d'implémentation détaillé pour le domaine de validation, rédigé en stricte conformité avec les spécifications architecturales et les principes du projet EMA0.3.
+1. État actuel
+	•	EMA0.2 est un prototype fonctionnel qui dispose d'un backtest basique, mais qui est principalement limité à tester les crossovers.
+	•	La plateforme manque actuellement de méthodes de validation statistique avancées telles que l'analyse in-sample/out-of-sample (IS/OOS), l'analyse walk-forward ou la simulation de Monte Carlo.
+	•	Ce qui doit être conservé : Le principe de générer un journal de transactions (Trade Ledger) comme base d'analyse de performance, bien que la structure exacte doive être standardisée par le BACKTEST AGENT.
+2. Problèmes identifiés
+	•	Limitation statistique : L'évaluation actuelle risque de sur-optimiser (curve-fitting) les paramètres sur le passé si l'on se fie uniquement au win rate sans tester sur des données non vues (OOS).
+	•	Dépendance au marché (Regime) : L'absence d'analyse par régime (tendance, range, volatilité) empêche de savoir exactement quand la stratégie est performante et quand elle se désintègre.
+	•	Risque d'instabilité : Sans validation Monte Carlo, il est impossible d'estimer le risque de ruine ou le drawdown du pire cas probabiliste.
+3. Architecture cible
+	•	Structure : Le module de validation agira comme une couche analytique supérieure. Il consommera les résultats bruts (Trade Ledger) générés par l'Execution Simulator du module backtest/.
+	•	Responsabilités : Mon rôle exclusif est de mesurer, classer et valider la robustesse de la stratégie sans jamais modifier sa logique interne ou ses signaux.
+	•	Interface avec les autres agents : Je dépends strictement du BACKTEST AGENT pour l'obtention du journal de transactions et du STRATEGY AGENT pour la définition des configurations à évaluer.
+4. Fichiers
+	•	Fichiers à créer :
+	•	backtest/walkforward.py : Logique de validation glissante (Train/Test séquentiels).
+	•	backtest/monte_carlo.py : Rééchantillonnage des trades (10 000 simulations) et calcul des percentiles.
+	•	backtest/regimes.py : Classification des conditions de marché (Trend, Range, Volatility) au moment des signaux.
+	•	backtest/validation.py : Orchestrateur qui agrège IS/OOS, Walk-Forward, Monte Carlo et classifie la stratégie (FAIL, WEAK, PROMISING, STRONG CANDIDATE).
+	•	Fichiers à modifier :
+	•	docs/backtest/validation.md : Documenter les formules mathématiques exactes et les seuils d'acceptation.
+5. Interfaces (Contrats)
+	•	Entrées requises (provenant de backtest/) :
+	•	List[BacktestTrade] : Le ledger complet avec timestamps, R multiple, et PnL net.
+	•	MarketData : Les données historiques (nécessaires pour l'analyse des régimes).
+	•	Sorties (Livrables de Validation) :
+	•	ValidationReport : Un objet structuré contenant toutes les métriques de validation.
+	•	MonteCarloMetrics : Dictionnaire contenant les percentiles (5e, 25e, médiane, 75e, 95e), la distribution du drawdown et la probabilité de ruine.
+	•	ClassificationResult : Un enum (FAIL, WEAK, PROMISING, STRONG CANDIDATE).
+6. Dépendances
+	•	Existantes à conserver : pandas et numpy (standards pour l'analyse quantitative en Python, permettant une exécution rapide de 10 000 simulations Monte Carlo).
+	•	Nouvelles dépendances : Aucune nouvelle dépendance lourde ne devrait être requise à ce stade pour respecter le principe de Simplicité. Les bibliothèques standard de statistiques et numpy suffisent.
+7. Tests
+	•	Fixtures nécessaires : Un mock_trade_ledger.json (jeu de données de trades factices mais déterministes) pour tester mes algorithmes avant même que le BACKTEST AGENT ne finisse son moteur d'exécution.
+	•	Tests unitaires : Vérifier que la séparation IS/OOS respecte strictement le ratio 70/30. Vérifier que la moyenne des équités finales du Monte Carlo converge vers la moyenne de l'échantillon initial.
+	•	Tests d'intégration : S'assurer que le pipeline Trade Ledger -> Validation Orchestrator -> Validation Report s'exécute sans erreur.
+8. Risques
+	•	Dépendance bloquante : Si le format de BacktestTrade change en cours de route côté BACKTEST AGENT, mes scripts d'analyse se briseront.
+	•	Performance (Monte Carlo) : 10 000 simulations sur un grand nombre de trades peuvent ralentir le système si elles ne sont pas vectorisées avec numpy.
+	•	Ambiguïté de Spécification : La définition exacte mathématique des "Régimes de marché" (ex: TREND_UP, RANGE) n'est pas détaillée dans la spécification technique.
+9. ARCHITECTURAL DECISION REQUIRED (ADR)
+La spécification mentionne la classification par régime mais ne définit pas les mathématiques de ces régimes. Je dois soumettre un ADR :
+	•	ADR-Validation-001 : Définition Mathématique des Régimes de Marché. Comment classifions-nous exactement TREND_UP, TREND_DOWN, RANGE, HIGH_VOLATILITY, LOW_VOLATILITY ? (ex: Basé sur la pente de l'EMA55 HTF ? Basé sur l'ADX ? Basé sur le percentile d'ATR ?) Cette décision nécessite une validation du STRATEGY AGENT ou de l'ARCHITECT.
+10. Ordre d'implémentation
+	1.	Création des Fixtures (mock_trade_ledger) pour isoler mon travail.
+	2.	Implémentation de backtest/monte_carlo.py (Vectorisation Numpy pour la vitesse).
+	3.	Implémentation de la séparation IS/OOS (70% / 30%).
+	4.	Implémentation de backtest/walkforward.py (Découpage temporel glissant).
+	5.	(En attente d'ADR) Implémentation de backtest/regimes.py.
+	6.	Implémentation de backtest/validation.py (Orchestrateur et matrice de Classification).
+	7.	Rédaction des tests unitaires et de la documentation.
+11. Critères d'acceptation
+Conformément à la "Definition of Done" :
+	•	L'implémentation des scripts IS/OOS, Walk-Forward et Monte Carlo est complète.
+	•	Les tests unitaires passent à 100% sur les fixtures.
+	•	Le système classifie automatiquement un jeu de données en FAIL, WEAK, PROMISING, ou STRONG CANDIDATE selon les règles établies.
+	•	La documentation de validation (docs/backtest/validation.md) est à jour.
+12. Handoff
+Pour que ce plan s'exécute parfaitement, j'ai besoin que :
+	•	Le BACKTEST AGENT valide publiquement la structure exacte du dictionnaire/dataclass BacktestTrade qu'il compte me fournir (clés exactes pour le PnL net, le R multiple, le timestamp de sortie).
+	•	L'équipe valide l'ADR sur la définition mathématique des régimes de marché.
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW
+}
+Strategy agent 
+:{ J'ai cloné et inspecté le dépôt Salomon-Ngane/EMA0.2 (accès en lecture seule, clone local) pour baser ce plan sur le code réel plutôt que sur des suppositions. Voici le plan complet, aucun code n'a été modifié.
+
+IMPLEMENTATION PLAN v1.0 — STRATEGY AGENT (strategy/)
+1. État actuel
+Ce qui existe réellement (EMA0.2), vérifié dans le repo :
+	•	Toute la logique stratégique tient dans un seul fichier : services/strategy.py (126 lignes), contenant :
+	•	get_last_pivot() — détection de pivot haut/bas avec fenêtre window (confirmé par candles futures ET passées).
+	•	evaluate_setup() — point d'entrée unique calculant SL/TP via pivots + filtre RR ≥ 2.7 (déjà conforme au principe « single entry point » de la spec).
+	•	analyze_market() — orchestre crossover + retest + appelle evaluate_setup().
+	•	Les indicateurs (EMA10, SMA35, EMA55) ne sont PAS calculés dans strategy/ : ils sont calculés en double, indépendamment, dans services/exchanges/crypto.py ET services/exchanges/deriv.py (fonctions _to_dataframe). Ceci viole directement la règle de dépendance de la spec section 5 (market/ ne doit rien savoir de la stratégie) et section 12 (paramètres non centralisés).
+	•	PIVOT_LEFT_RIGHT = 10 est une constante globale dans config.py, pas un StrategyConfig.
+	•	Le seuil RR >= 2.7 est un littéral codé en dur dans evaluate_setup().
+	•	Les noms de colonnes 'EMA10', 'SMA35', 'EMA55' sont codés en dur dans plusieurs fichiers (indicateurs + pivots + bot/handlers/admin.py).
+	•	Il n'existe aucun test, aucun dataset golden, aucun dossier tests/. Le seul commit visible dans le clone (d4aca9d Delete .github/workflows directory) montre même une suppression de CI existante.
+	•	Le backtest existant (bot/handlers/admin.py::backtest_cmd) réimplémente indépendamment les conditions de crossover et appelle evaluate_setup() directement — violation naissante de la Règle 2 (source unique de vérité) que la refonte doit résoudre, mais ce fichier appartient au BACKTEST/BOT agent, pas à moi.
+Ce qui fonctionne et doit être préservé tel quel (comportementalement) :
+	•	Évaluation sur candle fermée uniquement (i = len(df) - 2) — conforme à la spec, aucun lookahead détecté ici.
+	•	Logique de crossover LONG/SHORT — correspond exactement aux sections 14/15 de la spec.
+	•	Logique de retest (7 conditions) — correspond fidèlement à la section 16, fenêtre de 15 candles.
+	•	get_last_pivot confirme bien les pivots avec voisinage gauche/droite avant de les utiliser (pas de lookahead sur la confirmation elle-même).
+	•	Le filtre RR ≥ 2.7 avec rejet explicite (déjà dans l'esprit de la section 20).
+2. Problèmes identifiés
+#	Problème	Sévérité
+P1	Indicateurs dupliqués dans crypto.py et deriv.py (couche marché), pas dans strategy/	Élevée — violation architecturale directe
+P2	Aucune séparation indicateurs/structure/signaux/scoring/filtres/config	Élevée — bloque le multi-agent
+P3	PIVOT_LEFT_RIGHT réutilisé pour DEUX rôles distincts : (a) largeur de confirmation du pivot, (b) profondeur de recherche du dernier pivot valide (search_start = current_idx - window) — ce sont deux paramètres conceptuellement différents que la spec ne distingue pas non plus explicitement	Moyenne — ambiguïté de conception
+P4	Fallback silencieux dans get_last_pivot : si aucun pivot confirmé ne satisfait la condition BELOW_EMAS/ABOVE_EMAS dans la fenêtre de recherche, la fonction retombe sur un simple max/min des 50 dernières candles brutes — ce n'est plus un pivot confirmé, et ce comportement n'est documenté nulle part	Élevée — écart silencieux par rapport à la spec (section 18, "pivot structurel")
+P5	Condition SL BELOW_EMAS exige que le pivot soit sous les 3 MAs simultanément (EMA10 ET SMA35 ET EMA55) — la spec section 18 dit seulement "sous la structure EMA pertinente", sans préciser laquelle. Écart d'interprétation possible	Moyenne — nécessite clarification
+P6	Résultats renvoyés sous forme de dict à formes variables (SIGNAL/REJECTED/NONE), pas de contrat SignalSetup/SetupRejected structuré ; raisons de rejet en texte libre (f"R:R = {rr:.2f} < 2.7") au lieu d'enums	Élevée — bloque sections 21/22 de la spec
+P7	Bug mineur : si long_signal est vrai mais evaluate_setup renvoie status="NONE"(géométrie invalide), le code ne retourne pas et continue vers le bloc retest en dessous — comportement non intentionnel mais sans impact fonctionnel actuel car les conditions de retest sont indépendantes	Faible
+P8	Aucun ATR (section 13/23), aucun filtre MTF (24), aucun filtre volume (25), aucun scoring (26)	Attendu — ce sont des extensions expérimentales, pas un bug
+P9	Aucun test, aucun golden dataset — impossible aujourd'hui de garantir la non-régression	Élevée — bloquant pour toute refonte
+P10	bot/handlers/admin.py et main.py importent directement services.strategy.analyze_market / evaluate_setup — un renommage brutal du module casserait BOT sans coordination	Moyenne — risque de régression inter-module
+3. Architecture cible (périmètre STRATEGY uniquement)
+strategy/
+├── __init__.py          # ré-exporte l'API publique stable
+├── config.py             # StrategyConfig (dataclass, tous les paramètres)
+├── indicators.py         # EMA, SMA, ATR — pures fonctions sur DataFrame OHLCV brut
+├── structure.py           # pivots confirmés (get_pivot_high/get_pivot_low), no-fallback silencieux
+├── signals.py             # crossover LONG/SHORT, retest LONG/SHORT (détection pure, booléens/événements)
+├── setup.py               # assemblage SignalSetup / SetupRejected à partir des signaux + structure + RR
+├── scoring.py             # score 0–100 (désactivé par défaut, expérimental)
+├── filters.py             # ATR filter, MTF filter, volume filter (tous OFF par défaut)
+└── models.py              # dataclasses SignalSetup, SetupRejected, RejectionReason (enum)
+Contrat d'entrée : strategy/ consomme un DataFrame OHLCV brut (timestamp, open, high, low, close, volume), sans aucune colonne d'indicateur pré-calculée. C'est strategy/indicators.py qui calcule EMA10/SMA35/EMA55/ATR à partir des colonnes brutes. → Ceci corrige P1 mais implique une coordination avec MARKET agent (voir section 9).
+Contrat de sortie : strategy.setup.evaluate(df, config) -> SignalSetup | SetupRejected, avec SignalSetup/SetupRejected conformes aux sections 21/22 de la spec.
+Fonction d'orchestration équivalente à l'actuel analyze_market() : conservée comme fonction publique de haut niveau dans strategy/__init__.py (ou setup.py) pour que BOT/BACKTEST n'aient qu'un seul point d'entrée à consommer — évite de casser les deux appelants existants pendant la transition (voir Décision D5).
+4. Fichiers
+À créer :
+	•	strategy/__init__.py, config.py, indicators.py, structure.py, signals.py, setup.py, scoring.py, filters.py, models.py
+	•	tests/fixtures/btc_sample_15m.csv (golden dataset — nécessite coordination QA, voir section 9)
+	•	tests/strategy/test_indicators.py, test_structure.py, test_signals.py, test_setup.py, test_regression_golden.py
+	•	docs/strategy/specification.md, indicators.md, signal-rules.md, parameters.md (documentation du comportement figé)
+À modifier :
+	•	Aucun fichier hors strategy/ ne sera modifié par moi. En particulier, je ne toucherai pas à services/exchanges/crypto.py / deriv.py (retrait du calcul d'indicateurs) — cette modification appartient au MARKET agent, je ne fais que documenter le besoin.
+À supprimer (à terme, pas immédiatement) :
+	•	services/strategy.py — remplacé par strategy/, mais seulement après que BOT ait migré ses imports (voir Décision D5). Dans un premier temps, il peut devenir un simple shim de compatibilité.
+5. Interfaces
+# strategy/models.py
+class Direction(Enum): LONG, SHORT
+class SignalType(Enum): CROSSOVER, RETEST
+class RejectionReason(Enum):
+    RR_TOO_LOW, NO_VALID_SL, NO_VALID_TP, INVALID_GEOMETRY,
+    NO_CROSS, NO_RETEST, INSUFFICIENT_DATA, ATR_FILTER_FAILED,
+    HTF_FILTER_FAILED, VOLUME_FILTER_FAILED
+
+@dataclass(frozen=True)
+class SignalSetup:
+    symbol, timeframe, timestamp, direction: Direction
+    entry, stop_loss, take_profit
+    risk_distance, reward_distance, rr
+    signal_type: SignalType, score: int | None
+    metadata: dict
+
+@dataclass(frozen=True)
+class SetupRejected:
+    reason: RejectionReason
+    details: dict  # ex: {"rr": 1.84, "minimum_rr": 2.70}
+
+# strategy/config.py
+@dataclass(frozen=True)
+class StrategyConfig:
+    fast_ema: int = 10
+    mid_sma: int = 35
+    slow_ema: int = 55
+    atr_period: int = 14
+    pivot_confirm_window: int = 10      # remplace l'usage "confirmation" de PIVOT_LEFT_RIGHT
+    pivot_search_depth: int = 50        # remplace le fallback implicite (voir Décision D2)
+    retest_window: int = 15
+    minimum_rr: float = 2.7
+    retest_enabled: bool = True
+    atr_filter_enabled: bool = False
+    atr_min_multiplier: float = 0.8
+    mtf_filter_enabled: bool = False
+    volume_filter_enabled: bool = False
+    strategy_version: str = "ema_v0.3.0"
+
+# API publique
+def evaluate(df: pd.DataFrame, symbol: str, timeframe: str, config: StrategyConfig = DEFAULT) -> SignalSetup | SetupRejected | None
+None est renvoyé uniquement pour "pas de setup à évaluer" (ex. tendance neutre) — distinct d'un SetupRejected (setup détecté mais invalidé).
+6. Dépendances
+	•	Conservées : pandas (déjà utilisé, aucun changement).
+	•	Nouvelles : aucune dépendance externe nouvelle nécessaire pour le périmètre strategy/. dataclasses et enum sont stdlib.
+	•	Pas de dépendance vers ccxt, supabase, python-telegram-bot, websockets — confirmé absent de strategy/(respect strict de la Règle 2 / section 5).
+7. Tests
+	•	Unitaires (tests/strategy/) : EMA/SMA/ATR sur données synthétiques connues ; pivot confirmé vs non-confirmé ; crossover LONG/SHORT sur séquences construites à la main ; retest (les 7 conditions testées individuellement, y compris cas limites) ; RR calcul et rejet.
+	•	Régression (tests/strategy/test_regression_golden.py) : rejoue btc_sample_15m.csv et vérifie que les signaux produits par le nouveau moteur sont identiques à ceux produits par services/strategy.py actuel (Phase 2, section 82 : "EMA0.2 known signals == EMA0.3 signals").
+	•	Fixtures nécessaires : dataset golden à figer avant toute réécriture (Phase 0 de la spec — je constate qu'elle n'a pas encore été faite, voir Risques).
+8. Risques
+	•	R1 — Absence de Phase 0 : aucun dataset golden n'existe encore. Réécrire strategy/ sans référence de non-régression figée au préalable est risqué : je ne peux pas prouver l'équivalence comportementale sans ce dataset.
+	•	R2 — Dépendance MARKET agent : si les indicateurs restent calculés dans crypto.py/deriv.py pendant que je développe strategy/indicators.py, il y aura deux implémentations EMA en parallèle (risque de divergence numérique, ex. adjust=False doit être répliqué exactement).
+	•	R3 — Rupture d'interface BOT : main.py, bot/handlers/scan.py, bot/handlers/admin.py importent services.strategy directement. Sans shim de compatibilité, la migration casse le bot en production.
+	•	R4 — Ambiguïté P4/P5 (fallback pivot, condition SL) : si je choisis une interprétation sans validation, je risque de changer silencieusement le comportement du baseline — interdit par la Règle 1.
+	•	R5 — Duplication avec BACKTEST : bot/handlers/admin.py::backtest_cmd réimplémente déjà crossover — si je change la signature/l'algorithme sans coordination, ce backtest cassera silencieusement (mais il sera de toute façon remplacé par le BACKTEST agent).
+9. ARCHITECTURAL DECISION REQUIRED
+	•	D1 (bloquante) — Où calculer les indicateurs ? Je propose de les retirer de crypto.py/deriv.py et de les centraliser dans strategy/indicators.py, market/ ne fournissant que l'OHLCV brut. Ceci nécessite une coordination explicite avec le MARKET agent (qui possède ces fichiers) — je ne peux pas les modifier moi-même (Règle "ne travaille pas hors de ton domaine"). Décision requise : qui modifie crypto.py/deriv.py, et quand ?
+	•	D2 — Fallback pivot (P4). Le comportement actuel (retomber sur un max/min brut des 50 dernières candles si aucun pivot confirmé ne satisfait la condition EMA) doit-il être : (a) conservé tel quel et documenté comme faisant partie du baseline ema_v0.3.0, ou (b) remplacé par NO_VALID_SL/NO_VALID_TP (rejet explicite) ? Ce sont deux comportements de baseline très différents.
+	•	D3 — Condition SL/TP par rapport aux EMAs (P5). Le pivot SL doit-il être sous les trois moyennes (comportement actuel) ou seulement sous l'EMA55 ("la structure EMA pertinente" au sens le plus permissif) ? La spec section 18 ne tranche pas.
+	•	D4 — Séparation pivot_confirm_window vs pivot_search_depth (P3). Je propose de séparer ces deux paramètres dans StrategyConfig. Cela change la valeur par défaut effective de la profondeur de recherche (actuellement confondue avec 10, alors que le fallback réel regarde jusqu'à 50 candles en arrière). Est-ce accepté comme clarification, ou dois-je reproduire exactement le comportement actuel bit-à-bit malgré son incohérence ?
+	•	D5 — Stratégie de migration de l'interface publique. Je propose de garder services/strategy.py comme shim de compatibilité (il importe et ré-expose strategy.evaluate/strategy.analyze_market) le temps que BOT et BACKTEST migrent, plutôt que de casser les imports existants immédiatement. Validation requise, car cela touche indirectement au périmètre BOT/BACKTEST.
+10. Ordre d'implémentation
+	1.	Golden dataset (coordination QA/PROJECT — figer btc_sample_15m.csv + signaux attendus documentés à partir du comportement actuel de services/strategy.py).
+	2.	strategy/models.py + strategy/config.py (contrats, pas de logique).
+	3.	strategy/indicators.py (EMA/SMA/ATR) + tests unitaires isolés.
+	4.	strategy/structure.py (pivots) — implémentant la décision D2/D3/D4 validée.
+	5.	strategy/signals.py (crossover + retest) + tests.
+	6.	strategy/setup.py (assemblage SignalSetup/SetupRejected + RR).
+	7.	Test de régression contre le golden dataset — comparaison signal-par-signal avec services/strategy.py.
+	8.	strategy/filters.py + strategy/scoring.py (désactivés par défaut) — squelette seulement, pas d'activation baseline.
+	9.	Shim de compatibilité services/strategy.py (si D5 validée) pointant vers strategy/.
+	10.	Documentation docs/strategy/*.md.
+11. Critères d'acceptation
+	•	[ ] strategy/ ne dépend d'aucun module bot/, database/, services/exchanges/ (import-check statique).
+	•	[ ] Tous les paramètres stratégiques sont dans StrategyConfig, zéro littéral dispersé.
+	•	[ ] Le test de régression golden dataset passe : signaux identiques (direction, entry, SL, TP, RR) entre services/strategy.py (ancien) et strategy.evaluate() (nouveau), aux décisions D2–D4 explicitement documentées près.
+	•	[ ] Chaque rejet retourne un RejectionReason structuré, plus aucune chaîne libre comme unique moyen d'inspection.
+	•	[ ] Couverture de tests unitaires sur EMA/SMA/ATR/pivot/crossover/retest/RR.
+	•	[ ] Aucun changement de comportement du baseline non documenté (tout écart = ADR).
+12. Handoff
+	•	MARKET agent : doit confirmer/valider D1 — retrait du calcul d'indicateurs de crypto.py/deriv.py, et fournir un contrat MarketData/DataFrame OHLCV brut stable.
+	•	BACKTEST agent : consommera strategy.evaluate() — ne doit plus dupliquer les conditions crossover (actuellement fait dans admin.py::backtest_cmd). Doit être informé du format exact SignalSetup/SetupRejected avant de démarrer son propre moteur.
+	•	BOT agent : doit prévoir la migration de ses imports (services.strategy → strategy), idéalement après validation de D5.
+	•	QA agent : doit valider/fournir le golden dataset (tests/fixtures/btc_sample_15m.csv) avant l'étape 1 de mon ordre d'implémentation — je ne peux pas fabriquer seul une référence "vérité terrain" sans validation externe.
+	•	ARCHITECT/toi : validation requise sur D1–D5 avant que je commence l'implémentation.
+
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW
+J'attends ta validation (en particulier D1 à D5) avant de commencer toute implémentation.
+}
+
+Market agent:{ IMPLEMENTATION PLAN v1.0 — MARKET AGENT
+(Aucune modification de code effectuée à ce stade — document de réflexion uniquement, conformément à la demande.)
+
+1. État actuel
+Ce qui existe (audité directement sur Salomon-Ngane/EMA0.2, HEAD actuel) :
+services/exchanges/base.py    → ABC ExchangeInterface.fetch_ohlcv(symbol, timeframe, limit=150)
+services/exchanges/crypto.py  → fonction module-level, Binance→Bybit fallback interne (ccxt), retry x2, détection ban IP
+services/exchanges/deriv.py   → fonction module-level, WebSocket direct (wss://ws.derivws.com), TF_MAP local
+services/router.py            → dispatch crypto/deriv par pattern du symbole (VOL/R_/BOOM/CRASH/1HZ)
+config.py                     → VALID_TIMEFRAMES, PIVOT_LEFT_RIGHT
+Points d'appel confirmés (3 sites distincts, tous avec limit codé en dur) :
+	•	main.py::run_full_scan() → limit=150
+	•	bot/handlers/scan.py::scan_cmd() → limit=150
+	•	bot/handlers/admin.py::backtest_cmd() → limit = min(1000, ...), et lit directement df['EMA10'], df['SMA35'], df['EMA55'] pour un mini-backtest ad hoc.
+Ce qui fonctionne et doit être conservé :
+	•	La logique de dispatch crypto/deriv par pattern de symbole (router.is_deriv_symbol) est simple et fonctionne — à conserver telle quelle dans le nouveau router.py.
+	•	Le fallback Binance→Bybit avec détection explicite de ban IP (-1003, 418, banned until) est une logique métier éprouvée — à conserver fonctionnellement, seul son emplacement change (cf. §9 précédent, toujours en attente d'arbitrage).
+	•	L'URL/app_id WebSocket Deriv et le TF_MAP associé (granularités en secondes) sont corrects et à réutiliser.
+	•	La liste VALID_TIMEFRAMES dans config.py est correcte dans son contenu (1m…1w), seul son isolement pose problème.
+
+2. Problèmes identifiés
+#	Problème	Type	Sévérité
+P1	EMA10/SMA35/EMA55 calculés dans crypto.py/deriv.pyavant retour des données	Violation architecturale (AGENTS.md Règle 2, Spec §5/§7)	🔴 Bloquant
+P2	bot/handlers/admin.py::backtest_cmd lit directement les colonnes EMA du DataFrame retourné par le market layer	Couplage caché, non documenté dans la spec initiale	🔴 Bloquant
+P3	Aucune pagination — limit fixe (150 à 1000)	Limitation (Spec §9)	🔴 Bloquant
+P4	Pas de modèle canonique Candle/MarketData	Dette technique	🟠 Élevé
+P5	ExchangeInterface (ABC) non réellement implémentée par les providers (fonctions vs classes)	Dette technique	🟠 Élevé
+P6	Pas de retry/reconnexion sur deriv.py (contrairement à crypto.py)	Bug potentiel / robustesse	🟠 Élevé
+P7	Pas de cache — chaque scan redemande tout	Limitation	🟡 Moyen
+P8	Timeframe mapping dupliqué (config.py vs deriv.py)	Dette technique	🟡 Moyen
+P9	Signature actuelle (symbol, timeframe, limit) incompatible avec le contrat cible (symbol, timeframe, start, end)	Bloquant migration	🔴 Bloquant
+P10	Documentation API WebSocket Deriv non vérifiable par mes moyens actuels (déjà signalé lors de travaux précédents sur EMA Signal Bot)	Risque externe	🟠 Élevé
+P11	Un mini-backtest est implémenté directement dans bot/handlers/admin.py (hors backtest/)	Hors périmètre MARKET mais impacte le contrat que je dois fournir	🟡 À signaler au BACKTEST/BOT Agent
+3. Architecture cible
+market/
+├── __init__.py
+├── models.py          → Candle, MarketData (+ validation intégrité)
+├── timeframes.py       → mapping centralisé unique (valeurs + secondes), validation stricte
+├── providers/
+│   ├── __init__.py
+│   ├── base.py         → MarketProvider (ABC réelle, classes concrètes en héritent)
+│   ├── binance.py       → UN exchange, aucune logique de fallback
+│   ├── bybit.py         → UN exchange, aucune logique de fallback
+│   └── deriv.py         → WebSocket + retry/reconnexion
+├── router.py            → dispatch crypto/deriv + fallback binance→bybit + normalisation finale
+└── cache.py             → cache court terme par (symbol, timeframe)
+Responsabilités :
+	•	providers/* : parler à un seul exchange, paginer en interne sur la plage demandée, ne rien savoir des autres providers.
+	•	router.py : décider quel provider appeler, gérer le fallback (si validé — cf. §9), appliquer la normalisation finale (tri, dédup, validation).
+	•	models.py : porter le contrat de données — aucun indicateur, aucune logique de stratégie.
+	•	cache.py : réduire les appels réseau redondants sans jamais servir de source de vérité (toujours invalidable).
+Interfaces avec les autres agents :
+	•	STRATEGY Agent consomme MarketData (ou son équivalent DataFrame OHLCV brut) — sans indicateurs. C'est le point de jonction le plus sensible (cf. §9).
+	•	BACKTEST Agent consomme le même market/ via la même interface que le live (principe de source unique, Spec §3/§27).
+	•	BOT Agent ne doit plus jamais lire de colonnes d'indicateurs directement sur les données de marché (actuellement violé par admin.py::backtest_cmd).
+	•	DATABASE Agent : pas d'interaction directe attendue — le cache est en mémoire, pas persistant (sauf décision contraire).
+
+4. Fichiers
+À créer
+Fichier	Justification
+market/models.py	Contrat canonique Candle/MarketData exigé par Spec §6/§7
+market/timeframes.py	Centraliser le mapping timeframe → durée, éliminer P8
+market/providers/base.py	Interface réellement applicable (classes), corrige P5
+market/providers/binance.py	Provider isolé, pagination interne, corrige P3/P9
+market/providers/bybit.py	Idem
+market/providers/deriv.py	Reprend logique WebSocket existante + retry/reconnexion (corrige P6)
+market/router.py	Dispatch + fallback + normalisation finale
+market/cache.py	Corrige P7
+tests/unit/market/*	Couverture unitaire du module
+tests/fixtures/market/*.json	Réponses API mockées (Binance/Bybit/Deriv) pour tests sans réseau
+À modifier (hors mon périmètre direct — je ne les touche pas, je les signale aux agents concernés)
+Fichier	Qui doit le modifier	Pourquoi
+services/strategy.py	STRATEGY Agent	Doit calculer ses propres indicateurs sur des Candle bruts
+bot/handlers/admin.py::backtest_cmd	BOT Agent (ou retiré au profit de /backtest officiel du BACKTEST Agent)	Lit actuellement des colonnes EMA qui n'existeront plus
+main.py, bot/handlers/scan.py	BOT Agent	Appellent fetch_ohlcv_routed(symbol, tf, limit) — signature à faire évoluer vers le nouveau contrat
+config.py	À coordonner (fichier transverse)	VALID_TIMEFRAMES doit soit migrer vers market/timeframes.py, soit config.py doit l'importer depuis là — ambigu, cf. §9
+À supprimer (uniquement après validation complète, pas immédiatement)
+Fichier	Condition de suppression
+services/exchanges/(dossier complet)	Seulement après que market/ ait été validé sur le golden dataset ET que STRATEGY/BOT aient migré vers le nouveau contrat. Suppression prématurée = régression garantie.
+5. Interfaces (contrats proposés)
+# market/models.py
+@dataclass(frozen=True)
+class Candle:
+    timestamp: int   # ms epoch, UTC
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+@dataclass(frozen=True)
+class MarketData:
+    symbol: str
+    timeframe: str
+    candles: list[Candle]   # triées, dédupliquées, validées
+    provider: str
+
+    def to_dataframe(self) -> "pd.DataFrame":
+        """Retourne UNIQUEMENT les colonnes OHLCV brutes. Aucun indicateur."""
+# market/providers/base.py
+class MarketProvider(ABC):
+    @abstractmethod
+    async def get_ohlcv(
+        self, symbol: str, timeframe: str,
+        start: datetime, end: datetime
+    ) -> MarketData:
+        """Doit paginer en interne si l'exchange limite la taille de réponse."""
+# market/router.py
+async def get_ohlcv_routed(
+    symbol: str, timeframe: str,
+    start: datetime, end: datetime
+) -> MarketData: ...
+
+def get_provider_for(symbol: str) -> MarketProvider: ...
+# market/timeframes.py
+VALID_TIMEFRAMES: dict[str, int]  # ex: {"1m": 60, ..., "1w": 604800}
+def validate_timeframe(tf: str) -> None:  # lève une erreur explicite si invalide
+# market/cache.py
+async def get_cached_or_fetch(key: str, fetch_fn, ttl_seconds: int) -> MarketData: ...
+⚠️ Ces signatures sont des propositions, pas des décisions figées — notamment le remplacement de limit par start/end implique que tous les appelants actuels (main.py, scan.py, admin.py) devront être adaptés par le BOT Agent. Cette dépendance doit être coordonnée avant que je ne bascule le contrat.
+
+6. Dépendances
+Conservées :
+	•	ccxt (Binance/Bybit) — déjà présent, éprouvé.
+	•	websockets (Deriv) — déjà présent.
+	•	pandas — conservé uniquement comme format de sortie optionnel via MarketData.to_dataframe(), plus comme structure de calcul.
+Nouvelles éventuelles (à valider, pas encore ajoutées) :
+	•	pydantic (optionnel) pour la validation stricte de Candle/MarketData — alternative à dataclass + validation manuelle. Décision ouverte, cf. §9.
+	•	Aucune dépendance de cache externe (Redis, etc.) proposée à ce stade — un cache en mémoire (dict + TTL) suffit pour un process unique sur Render free tier, sauf si vous voulez un cache partagé entre plusieurs instances (peu probable ici).
+
+7. Tests
+Unitaires :
+	•	Candle/MarketData : tri chronologique, dédoublonnage, rejet de valeurs non numériques.
+	•	timeframes.py : timeframe invalide → exception explicite, jamais de fallback silencieux (Spec §10).
+	•	router.is_deriv_symbol : couverture des patterns existants (VOL/R_/BOOM/CRASH/1HZ) + cas limites.
+Intégration (mockées, zéro appel réseau réel en CI) :
+	•	Pagination reconstituée correctement sur plusieurs pages simulées.
+	•	Fallback Binance→Bybit déclenché uniquement sur erreur qualifiée (ban IP), pas sur n'importe quelle exception — si le fallback est bien conservé selon l'arbitrage §9.
+	•	Reconnexion Deriv après coupure WebSocket simulée.
+Régression :
+	•	Golden dataset BTC (tests/fixtures/btc_sample_15m.csv, propriété de QA Agent selon Spec §70) : je dois produire un jeu de fixtures spécifique au market layer (réponses API brutes mockées) — à distinguer du golden dataset stratégique de QA. Coordination nécessaire pour éviter le doublon.
+Fixtures nécessaires :
+	•	Réponses fetch_ohlcv mockées Binance/Bybit (format ccxt réel).
+	•	Payloads WebSocket Deriv mockés (format ticks_history/candles).
+
+8. Risques
+Risque	Impact	Mitigation
+Documentation WebSocket Deriv non vérifiable (P10, déjà connu)	Reconnexion/retry pourrait être mal calibrée	Implémenter défensivement, tester avec payloads réels observés, signaler toute incertitude au lieu de deviner
+Rupture de contrat (indicateurs retirés) avant que STRATEGY/BOT soient prêts	Panne totale du scan en production	Ne pas basculer tant que l'arbitrage §9 (point 1) n'est pas tranché et que les agents concernés n'ont pas confirmé leur disponibilité
+Suppression prématurée de services/exchanges/	Régression silencieuse	Suppression uniquement après double validation (golden dataset + confirmation STRATEGY/BOT)
+Rate limits Binance/Bybit non calibrés précisément pour la pagination	Ban IP en environnement de test/prod	Définir des limites de requêtes conservatrices dès l'implémentation, pas d'optimisation prématurée
+Chevauchement de responsabilité sur config.py	Conflit avec un autre agent qui le modifierait en parallèle	Signaler explicitement avant toute modification (cf. Handoff)
+9. ARCHITECTURAL DECISION REQUIRED
+Ces points restent non tranchés — je ne les considère pas comme des décisions validées et je n'implémenterai rien qui en dépende avant votre arbitrage :
+	1.	Retrait des indicateurs de market/ : maintenant (Phase 1) ou reporté à la Phase 2 ? (question posée précédemment, toujours sans réponse) — impact confirmé aujourd'hui : touche non seulement strategy.py mais aussi bot/handlers/admin.py::backtest_cmd (P2).
+	2.	Emplacement du fallback Binance→Bybit : déplacé dans router.py (providers stricts) ou conservé group é comme actuellement ? (question posée précédemment, toujours sans réponse)
+	3.	Cache : mémoire simple maintenant, ou reporté ? (question posée précédemment, toujours sans réponse)
+	4.	Candle/MarketData : dataclass simple ou pydantic ? Impact sur les dépendances (§6) et sur la rigueur de validation.
+	5.	Ownership de config.py : VALID_TIMEFRAMES doit-il être supprimé de config.py au profit de market/timeframes.py, avec un ré-export pour compatibilité, ou dupliqué temporairement ? config.py est un fichier transverse non explicitement attribué à un agent dans AGENTS.md — ambiguïté à signaler.
+	6.	Support multi-timeframe simultané (MTF, Spec §24) : la spec mentionne un besoin futur (4H régime / 1H tendance / 15m entrée) sans préciser si market/ doit exposer une méthode de fetch multi-timeframe groupée ou si STRATEGY orchestrera plusieurs appels simples. Non urgent pour la baseline (MTF est optionnel), mais à clarifier avant la Phase 5.
+	7.	bot/handlers/admin.py::backtest_cmd duplique une logique de backtest en dehors de backtest/ (P11) — hors de mon périmètre, mais je signale que ce fichier devra être traité par BOT Agent et/ou remplacé par le futur /backtest officiel (BACKTEST Agent). Je ne le modifie pas moi-même.
+
+10. Ordre d'implémentation (une fois les arbitrages du §9 obtenus)
+	1.	market/timeframes.py — le plus isolé, aucune dépendance externe.
+	2.	market/models.py (Candle, MarketData) + tests unitaires associés.
+	3.	market/providers/base.py — interface abstraite.
+	4.	market/providers/binance.py puis bybit.py — un provider à la fois, testé isolément avant le suivant.
+	5.	market/providers/deriv.py — en dernier des providers, car dépend de la clarification P10.
+	6.	market/router.py — assemble tout, applique le fallback selon l'arbitrage retenu.
+	7.	market/cache.py — uniquement si validé en §9.
+	8.	Tests d'intégration router (mockés).
+	9.	Validation croisée sur le golden dataset avec STRATEGY Agent avant toute suppression de services/exchanges/.
+
+11. Critères d'acceptation
+Le travail MARKET sera considéré terminé quand :
+	•	[ ] market/ expose get_ohlcv_routed(symbol, timeframe, start, end) sans paramètre limit.
+	•	[ ] Aucune ligne de market/ ne calcule d'indicateur (EMA/SMA/ATR/pivot).
+	•	[ ] Les trois providers héritent réellement de MarketProvider (pas de fonctions module-level).
+	•	[ ] La pagination reconstitue un historique complet sur une plage demandée, sans plafond arbitraire.
+	•	[ ] Le timeframe 1w est supporté de bout en bout et testé.
+	•	[ ] Un timeframe invalide lève une erreur explicite (jamais de fallback silencieux).
+	•	[ ] Tous les tests unitaires et d'intégration passent sans appel réseau réel.
+	•	[ ] Le comportement du golden dataset (signaux connus d'EMA0.2) reste identique une fois STRATEGY Agent branché sur le nouveau contrat.
+	•	[ ] PROJECT_STATE.md mis à jour avec l'état du module market/.
+
+12. Handoff
+Ce dont j'ai besoin des autres agents avant/pendant mon implémentation :
+	•	STRATEGY Agent : confirmation de sa capacité à consommer des Candle/MarketData bruts (sans EMA/SMA pré-calculés) et de son calendrier — conditionne l'arbitrage §9.1.
+	•	BOT Agent : prise en compte que main.py, scan.py et surtout admin.py::backtest_cmd devront être adaptés à la nouvelle signature (symbol, timeframe, start, end) — et que backtest_cmd perd son accès direct aux indicateurs.
+	•	BACKTEST Agent : confirmation que le futur /backtest officiel remplacera à terme le mini-backtest actuel de admin.py (P11), pour éviter double emploi.
+	•	QA Agent : coordination sur les fixtures — éviter de dupliquer le golden dataset stratégique (Spec §70) et mes fixtures de providers (réponses API mockées, qui sont un besoin différent).
+	•	DOC/ARCHITECT Agent (ou vous) : arbitrage formel sur les 7 points du §9 avant que je ne débute l'implémentation réelle.
+
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW
+J'attends votre validation (notamment sur les points du §9) avant de commencer toute implémentation.
+}
+
+Database agent :
+{ EMA0.3 — DATABASE AGENT — Implementation Plan v1.0
+Aucune modification de code effectuée. Analyse basée sur le clone réel de Salomon-Ngane/EMA0.2 (branche par défaut), la Technical Specification v1.0, AGENTS.md et PROJECT_STATE.md.
+
+1. État actuel
+Ce qui existe réellement en EMA0.2
+	•	Stack : Supabase (Postgres) via supabase-py, client synchrone appelé dans un thread (asyncio.to_thread) depuis database/connection.py.
+	•	Deux tables seulement : users (telegram_id, username, role, max_assets) et assets (telegram_id, symbol, timeframe).
+	•	Aucune trace de migration dans le repo (pas de dossier migrations/, pas de .sql). Le schéma actuel a donc été créé manuellement dans le dashboard Supabase — il n'existe nulle part comme source de vérité versionnée.
+	•	Aucune persistence pour signaux ou backtests. /backtest (dans bot/handlers/admin.py) est un calcul 100% en mémoire, jeté après l'envoi du message Telegram. Les setups rejetés (REJECTED_LOGS) sont stockés dans une deque en mémoire, perdue au redémarrage.
+	•	Le statut "en attente d'approbation" (pending) n'est pas un rôle stocké : un utilisateur non approuvé n'a aucune ligne dans users (start.py : if not prof: → message d'attente). L'approbation crée la ligne via upsert_user.
+	•	max_assets est dérivé du rôle et dupliqué en dur à deux endroits (admin.py et start.py's button_handler) : free→5, premium→20, admin→999.
+Ce qui fonctionne et doit être conservé
+	•	Le modèle relationnel simple telegram_id comme clé fonctionnelle pour users/assets — fonctionne en prod, ne doit pas casser pendant la transition.
+	•	Les signatures actuelles de database/users.py et database/assets.py (get_user_profile, upsert_user, get_all_assets, get_user_assets, add_asset, remove_asset, update_asset_tf) sont consommées directement par bot/ et main.py. Elles doivent rester compatibles tant que le bot 0.2/0.3 transitionnel tourne dessus.
+	•	Le flux d'approbation admin (absence de ligne = pending) fonctionne et est simple ; le changer a un impact comportemental (cf. section 9).
+
+2. Problèmes identifiés
+#	Problème	Type	Impact
+1	Schéma DB non versionné, non reproductible (créé à la main sur Supabase)	Dette technique	Bloque directement l'exigence de reproductibilité de la spec (§41-42)
+2	Aucune persistence des signaux → dédup impossible, historique perdu	Limitation	Bloque §58 (déduplication) et §60 (signals)
+3	Aucune persistence des backtests/trades → aucun résultat de recherche n'est conservable	Limitation	Bloque tout le pilier "recherche reproductible" de la spec
+4	max_assets dupliqué en dur dans 2 fichiers bot/	Dette technique	Hors périmètre DATABASE (fichier bot/), mais impacte le futur champ role → à signaler au BOT Agent, ne pas corriger moi-même
+5	Pas de clé primaire propre sur assets, filtrage par paire (telegram_id, symbol)	Risque	Fragile si un symbole doit un jour supporter plusieurs lignes (ex. plusieurs timeframes déjà le cas — actuellement add_asset ne vérifie pas l'unicité (telegram_id, symbol, timeframe), risque de doublons silencieux
+6	Rôle utilisateur stocké en TEXTlibre, sans contrainte	Risque	Une faute de frappe dans role casse silencieusement les vérifications prof.get("role") != "admin"
+7	Statut "pending" représenté par l'absence de ligne plutôt qu'une valeur explicite	Dette technique	Ambigu à long terme (une ligne absente peut aussi vouloir dire "jamais rencontré" vs "en attente") — à trancher, pas à changer unilatéralement
+Aucun bug bloquant trouvé dans le code DB existant — le principal problème est une absence de persistence pour 4 des 6 tables requises par la spec, pas une correction de bug.
+
+3. Architecture cible
+database/
+├── connection.py       (existant, étendu si besoin)
+├── models.py            (NOUVEAU — schémas/dataclasses typés)
+├── users.py             (existant, étendu — compatibilité conservée)
+├── assets.py            (existant, étendu — compatibilité conservée)
+├── signals.py           (NOUVEAU)
+├── backtests.py          (NOUVEAU — inclut accès backtest_trades)
+├── validation.py         (NOUVEAU)
+└── migrations/
+    ├── 0001_init_users_assets_uuid.sql
+    ├── 0002_create_signals.sql
+    ├── 0003_create_backtests.sql
+    ├── 0004_create_backtest_trades.sql
+    └── 0005_create_validation_runs.sql
+Responsabilités :
+	•	database/ : persister, retourner des données brutes/typées. Ne décide jamais si un signal est valide, si un backtest est "PROMISING", etc. (conforme à AGENTS.md).
+	•	Interfaces avec les autres agents :
+	•	STRATEGY Agent → produit SignalSetup, DATABASE fournit save_signal(setup) et signal_exists(signal_id).
+	•	BACKTEST Agent → produit BacktestResult (métriques + liste de BacktestTrade), DATABASE fournit save_backtest(...) / save_trades(...).
+	•	VALIDATION Agent → produit un rapport de validation, DATABASE fournit save_validation_run(...).
+	•	BOT Agent → consomme get_user_profile, get_user_assets, get_recent_signals, etc. — jamais de SQL direct côté bot.
+	•	QA Agent → possède tests/, je fournis les fixtures et la stratégie de test, QA valide/intègre en CI.
+
+4. Fichiers
+Fichier	Action	Justification
+database/connection.py	Modifier(mineur)	Ajouter éventuellement un client async natif si le volume de requêtes de backtest le justifie (à discuter, cf. §9) — sinon aucun changement
+database/users.py	Modifier	Ajouter id (UUID) en conservant telegram_id comme clé d'appel ; garder les signatures existantes intactes pour ne pas casser bot/
+database/assets.py	Modifier	Ajouter user_id (FK), ajouter contrainte d'unicité applicative en plus de la contrainte DB
+database/models.py	Créer	Centraliser les schémas de données (dataclasses/typed dict) pour SignalRecord, BacktestRecord, BacktestTradeRecord, ValidationRunRecord — évite que STRATEGY/BACKTEST agents doivent deviner la forme des objets attendus
+database/signals.py	Créer	save_signal, signal_exists, get_recent_signals, mark_signal_status
+database/backtests.py	Créer	save_backtest, save_backtest_trades, get_backtest, get_backtest_trades
+database/validation.py	Créer	save_validation_run, get_validation_runs
+database/migrations/*.sql	Créer	Source de vérité versionnée du schéma — comble le problème #1
+(aucune suppression)	—	Rien n'est supprimé ; toute évolution de users/assets est additive
+5. Interfaces (contrats proposés)
+# database/models.py
+@dataclass
+class SignalRecord:
+    signal_id: str            # hash — voir §9 pour l'algorithme
+    strategy_version: str
+    symbol: str
+    timeframe: str
+    candle_timestamp: datetime
+    direction: str             # "LONG" | "SHORT"
+    signal_type: str            # "CROSSOVER" | "RETEST"
+    entry: float
+    stop_loss: float
+    take_profit: float
+    rr: float
+    score: float | None
+    configuration: dict         # cf. §9 — proposé, pas dans le minimum §60
+    metadata: dict | None
+
+@dataclass
+class BacktestRecord:
+    strategy_version: str
+    config_hash: str
+    configuration: dict
+    symbol: str
+    timeframe: str
+    provider: str
+    start_date: datetime
+    end_date: datetime
+    fee_config: dict
+    slippage_config: dict
+    ambiguous_candle_policy: str
+    metrics: dict
+
+@dataclass
+class BacktestTradeRecord:
+    trade_index: int
+    entry_time: datetime
+    exit_time: datetime
+    direction: str
+    entry: float
+    exit: float
+    stop_loss: float
+    take_profit: float
+    r_multiple: float
+    gross_pnl: float
+    fees: float
+    slippage: float
+    net_pnl: float
+    exit_reason: str
+# database/signals.py
+async def save_signal(record: SignalRecord) -> SignalRecord | None: ...
+async def signal_exists(signal_id: str) -> bool: ...
+async def get_recent_signals(symbol=None, timeframe=None, limit=50) -> list[dict]: ...
+
+# database/backtests.py
+async def save_backtest(record: BacktestRecord) -> str: ...          # retourne backtest_id
+async def save_backtest_trades(backtest_id: str, trades: list[BacktestTradeRecord]) -> None: ...
+async def get_backtest(backtest_id: str) -> dict | None: ...
+async def get_backtest_trades(backtest_id: str) -> list[dict]: ...
+
+# database/validation.py
+async def save_validation_run(record: ValidationRunRecord) -> str: ...
+async def get_validation_runs(symbol=None, timeframe=None) -> list[dict]: ...
+Contrat de dédup : signal_exists(signal_id) doit être appelé par STRATEGY/BOT avant notification Telegram. La contrainte UNIQUE en base est un filet de sécurité, pas le mécanisme principal (pour éviter des erreurs SQL bruyantes dans le flux normal).
+
+6. Dépendances
+Dépendance	Statut	Justification
+supabase-py	Conservée	Déjà en place, aucune raison de changer de client pour la persistence CRUD simple
+python-dotenv	Conservée	Config existante
+Aucune nouvelle dépendance runtime	Proposé	Le schéma proposé (JSONB, UUID, contraintes) est nativement supporté par Postgres/Supabase — pas besoin d'ORM
+(optionnel) asyncpg ou psycopg[binary]	À valider	Uniquement si le volume d'écriture de backtest_trades (potentiellement des milliers de lignes par backtest) rend l'insertion via supabase-py + asyncio.to_thread trop lente. Je ne l'ajoute pas sans preuve de besoin.
+(pour les tests) Postgres local (Docker) ou projet Supabase de test	À valider avec QA Agent	Nécessaire pour tester de vraies migrations/contraintes JSONB — SQLite ne peut pas valider fidèlement ce schéma
+7. Tests
+Unitaires
+	•	Validation des dataclasses (SignalRecord, BacktestRecord, etc.) — champs requis, types.
+	•	Génération du signal_id (déterminisme : mêmes entrées → même hash).
+	•	Génération du config_hash (déterminisme, insensibilité à l'ordre des clés JSON).
+Intégration (nécessite une DB réelle — coordination QA Agent)
+	•	save_signal puis signal_exists → doit retourner True.
+	•	Insertion d'un doublon exact de signal → doit être bloquée par la contrainte UNIQUE, pas par une exception non gérée.
+	•	save_backtest + save_backtest_trades → get_backtest_trades retourne le nombre exact de trades, dans l'ordre (trade_index).
+	•	Suppression en cascade : supprimer un backtest supprime ses backtest_trades.
+	•	Migration users/assets : vérifier que le backfill user_id à partir de telegram_id ne perd aucune ligne existante.
+Régression
+	•	Rejouer les fonctions publiques existantes de users.py/assets.py avec les mêmes signatures qu'en EMA0.2, sur le schéma migré — les appels du bot/ actuel ne doivent rien changer côté code.
+Fixtures nécessaires
+	•	tests/fixtures/sample_signal.json
+	•	tests/fixtures/sample_backtest_with_trades.json
+	•	Un dataset SQL de départ simulant l'état EMA0.2 (users/assets avant migration) pour tester le backfill.
+(Je fournis fixtures + scénarios ; l'intégration en CI reste la responsabilité de QA Agent.)
+
+8. Risques
+Risque	Nature	Mitigation proposée
+Migration assets/users en prod pendant que le bot 0.2 tourne encore	Régression	Migration strictement additive (nouvelles colonnes nullable puis backfill), aucun DROP/RENAME avant validation complète
+Volume d'écriture backtest_trades (un backtest peut générer des centaines/milliers de trades)	Technique/perf	Insertion en batch, pas ligne par ligne ; réévaluer asyncpg si besoin (cf. §6)
+Le champ configuration (JSONB) devient une "boîte noire" difficile à requêter pour la matrice asset/timeframe (§50)	Technique	Accepter des requêtes JSONB (->>') pour l'analytique, ou dupliquer certains champs clés en colonnes si les besoins de requêtage deviennent lourds (à réévaluer après Phase 4)
+Dépendance vis-à-vis de STRATEGY Agent	Inter-agent	J'ai besoin de connaître la forme exacte finale de SignalSetup/StrategyConfig avant de figer models.py — actuellement je me base sur la spec conceptuelle (§12, §21), pas sur du code STRATEGY réel
+Dépendance vis-à-vis de BACKTEST Agent	Inter-agent	Idem pour BacktestTrade (§28) — la forme exacte de metrics (dict libre vs structure fixe) doit être confirmée avant implémentation finale
+Rôle utilisateur en TEXT libre change de comportement si je passe à un CHECK	Régression potentielle	Ne pas appliquer le CHECK avant d'avoir audité toutes les valeurs de role réellement présentes en prod
+9. ARCHITECTURAL DECISION REQUIRED
+Ces points restent des hypothèses de ma part, pas des décisions actées — je ne les implémente pas tant qu'ils ne sont pas tranchés.
+	1.	Identifiants : UUID (proposé) vs BIGSERIAL pour les clés primaires de signals/backtests/backtest_trades/validation_runs. UUID facilite la génération côté client (STRATEGY/BACKTEST agents) sans round-trip DB, mais est légèrement plus lourd en index.
+	2.	Format de configuration : JSONB (proposé) vs colonnes typées séparées pour configuration/metrics. Impacte directement la facilité des requêtes analytiques du §50.
+	3.	Algorithme de config_hash : non spécifié par la Technical Spec. Je propose sha256(json.dumps(config, sort_keys=True)), mais c'est une hypothèse — toute autre équipe reproduisant un backtest doit utiliser exactement le même algorithme.
+	4.	Outil de migration : SQL brut versionné dans database/migrations/ (proposé, portable) vs Supabase CLI migrations. Impacte QA Agent/CI.
+	5.	Champ signals.status (active/expired/invalidated) et signals.configuration : ne font pas partie du minimum §60 de la spec. Je les propose pour la traçabilité, mais ce sont des ajouts de périmètre — à valider explicitement, sinon je les retire et respecte le minimum strict.
+	6.	Rôle pending : actuellement représenté par l'absence de ligne dans users. Mon schéma propose role DEFAULT 'pending', ce qui change le comportement (une ligne serait créée dès le premier /start). C'est une décision produit, pas seulement technique — je ne la tranche pas seul.
+	7.	Contrainte CHECK sur role : actuellement aucune contrainte. L'ajouter est un changement de comportement (une valeur de rôle inattendue casserait l'insertion au lieu d'être silencieusement acceptée).
+	8.	Ambiguïté transverse hors périmètre DB : AGENTS.md §4 liste un "DOC Agent" et un "ARCHITECT Agent" absents du tableau des 7 agents actifs de PROJECT_STATE.md §6. Signalé pour information — n'affecte pas mon implémentation mais mérite clarification côté ARCHITECT/coordination projet.
+	9.	Base de test : Docker Postgres local vs projet Supabase dédié aux tests — dépend d'un arbitrage avec QA Agent, hors de mon autorité seule.
+
+10. Ordre d'implémentation (une fois les décisions §9 tranchées)
+	1.	Rédiger et faire valider database/models.py (contrats de données) — avant tout le reste, car STRATEGY/BACKTEST en dépendent.
+	2.	Migration 0001 : ajout non-destructif id, created_at, updated_at sur users ; ajout id, user_id sur assets + backfill + contrainte UNIQUE(user_id, symbol, timeframe).
+	3.	Migration 0002 : création signals.
+	4.	Migration 0003 + 0004 : création backtests puis backtest_trades (dépendance FK).
+	5.	Migration 0005 : création validation_runs.
+	6.	Implémenter database/signals.py, database/backtests.py, database/validation.py.
+	7.	Étendre database/users.py/assets.py en gardant les signatures existantes.
+	8.	Fournir les fixtures de test à QA Agent + scénarios d'intégration proposés en §7.
+	9.	Documenter le schéma final dans docs/architecture/ (ou docs/agents/agent-database.md selon la structure §73 de la spec).
+	10.	Mettre à jour PROJECT_STATE.md (tables créées, décisions tranchées) et CHANGELOG.md.
+
+11. Critères d'acceptation
+	•	[ ] Les 6 tables minimales de la spec (§59) existent, versionnées via migrations SQL relisibles.
+	•	[ ] Aucune régression : toutes les fonctions publiques actuelles de database/users.py/assets.py fonctionnent à l'identique après migration, sans changement d'appel côté bot/.
+	•	[ ] signal_exists() empêche une double notification pour un signal identique (test d'intégration passant).
+	•	[ ] Un backtest + ses backtest_trades sont insérables, relisibles, et reproductibles (mêmes champs que §41 présents et non nuls).
+	•	[ ] Un validation_run complet (IS/OOS/walk-forward/Monte Carlo/classification) est stockable et relisible.
+	•	[ ] Le database layer ne contient aucune logique de décision stratégique (audit croisé possible par STRATEGY/QA).
+	•	[ ] Toutes les décisions listées en §9 ont une réponse explicite écrite (validée ou tranchée autrement) avant le merge.
+	•	[ ] Documentation du schéma à jour dans docs/.
+	•	[ ] PROJECT_STATE.md et CHANGELOG.md mis à jour.
+
+12. Handoff — ce dont j'ai besoin des autres agents
+	•	STRATEGY Agent : la forme finale et stable de SignalSetup/StrategyConfig (types exacts, champs optionnels) avant que je fige models.py définitivement.
+	•	BACKTEST Agent : la forme finale de BacktestTrade et du dict metrics (structure fixe ou libre ?) — impacte directement le schéma backtests.metrics (JSONB libre vs colonnes).
+	•	VALIDATION Agent : la structure exacte attendue pour in_sample_metrics/out_of_sample_metrics/walk_forward_metrics/monte_carlo_metrics.
+	•	QA Agent : confirmation de l'environnement de test (Docker Postgres local vs Supabase de test) et de l'outil de migration retenu (§9.4/§9.9), car cela conditionne comment j'écris les migrations et les fixtures.
+	•	BOT Agent : information (pas une demande d'action) — le champ max_assets dupliqué en dur dans admin.py/start.py gagnerait à être centralisé côté DB ou config partagée, mais ce n'est pas mon périmètre ; je le signale seulement.
+	•	ARCHITECT / coordination projet : arbitrage sur les décisions §9.1, §9.2, §9.4, §9.6, §9.7, §9.9 — ce sont des choix structurants qui dépassent le seul module database/.
+
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW
+J'attends la validation (ou les arbitrages) sur la section 9 avant de commencer toute implémentation.
+}
+
+Bot agent :{
+Voici le Implementation Plan v1.0 du BOT AGENT. Je n’ai effectué aucune modification du code.
+J’ai également vérifié le dépôt public Salomon-Ngane/EMA0.2 référencé par la Technical Specification : le dépôt existe et contient notamment bot/, database/, services/, config.py, main.py et requirements.txt. (GitHub) La documentation de projet confirme que l’interface Telegram relève exclusivement du BOT AGENT et que la stratégie doit rester une source de vérité unique.
+Limitation importante : l’index GitHub accessible ici ne m’a pas permis de récupérer le contenu détaillé du dossier bot/. Je ne vais donc pas inventer les noms/classes/fichiers EMA0.2 que je n’ai pas pu vérifier. Les éléments explicitement marqués À vérifier devront être confirmés avant implémentation.
+EMA0.3 — BOT AGENT
+Implementation Plan v1.0
+Statut : READY FOR REVIEW — aucune implémentation commencée
+
+1. État actuel
+1.1 État du projet
+EMA0.3 est encore dans sa phase d'initialisation/architecture.
+Le PROJECT_STATE.md indique :
+	•	EMA0.2 est la baseline historique ;
+	•	l'architecture EMA0.3 est définie ;
+	•	les sept agents travaillent actuellement sur leurs plans ;
+	•	aucune implémentation significative EMA0.3 ne doit commencer avant validation des plans.
+Le bot fait partie des domaines explicitement attribués au BOT Agent.
+EMA0.3 doit rester un système de génération/recherche de signaux, et pas un moteur d'exécution automatique d'ordres.
+
+1.2 EMA0.2
+Le dépôt EMA0.2 actuellement référencé est :
+Salomon-Ngane/EMA0.2
+La structure visible du dépôt contient notamment :
+bot/
+database/
+services/
+config.py
+main.py
+requirements.txt
+(GitHub)
+Les dépendances actuellement déclarées incluent notamment :
+python-telegram-bot>=20.0
+supabase
+pandas
+ccxt
+aiohttp
+python-dotenv
+websockets
+(GitHub)
+Le config.py EMA0.2 contient notamment :
+	•	token Telegram ;
+	•	configuration Supabase ;
+	•	configuration Render ;
+	•	ADMIN_USERNAME ;
+	•	ADMIN_ID ;
+	•	liste des timeframes ;
+	•	PIVOT_LEFT_RIGHT.
+(GitHub)
+Fonctionnalités EMA0.2 à préserver
+D'après la Technical Specification et le mandat BOT :
+/start
+/allow
+/list
+/add_asset
+/remove_asset
+/set_tf
+/backtest
+/scan
+/logs
+/top_scan
+/restart
+et préparer :
+/validate
+/stats
+EMA0.2 est décrit comme un prototype fonctionnel disposant notamment de :
+	•	notifications Telegram ;
+	•	gestion utilisateurs ;
+	•	gestion assets ;
+	•	backtesting basique ;
+	•	détection de signaux ;
+	•	gestion de R:R ;
+	•	retest.
+Ce qui doit être conservé
+Le comportement fonctionnel pertinent doit être conservé lorsqu'il ne contredit pas EMA0.3 :
+	•	interface Telegram comme point d'entrée utilisateur ;
+	•	gestion des utilisateurs ;
+	•	gestion des assets ;
+	•	configuration des timeframes ;
+	•	déclenchement des scans ;
+	•	consultation des backtests ;
+	•	notifications de signaux ;
+	•	consultation des logs ;
+	•	commandes opérationnelles existantes ;
+	•	compatibilité avec les contrats des autres modules.
+Important : conserver le comportement fonctionnel ne signifie pas conserver les implémentations présentant des problèmes de sécurité ou de couplage.
+
+2. Problèmes identifiés
+2.1 Autorisation
+Problème critique
+Le mandat BOT identifie explicitement des problèmes d'autorisation hérités d'EMA0.2.
+Le principal objectif sera donc de supprimer tout modèle dans lequel une action privilégiée peut être autorisée uniquement sur la base :
+	•	d'un username ;
+	•	d'une donnée fournie dans un callback ;
+	•	d'un état ancien ;
+	•	d'une information utilisateur non vérifiée au moment de l'action.
+Le config.py EMA0.2 contient notamment un ADMIN_USERNAME et un ADMIN_ID. (GitHub)
+Architecture cible
+L'identité Telegram réellement associée à l'update doit être résolue puis comparée aux permissions persistées.
+Conceptuellement :
+Telegram Update
+      ↓
+Authenticated Telegram User
+      ↓
+Database user lookup
+      ↓
+Permission check
+      ↓
+Authorized action
+
+2.2 Callback Telegram
+Un callback Telegram ne doit jamais être considéré comme une preuve d'identité.
+Exemple interdit :
+callback_data = "allow:username"
+puis autoriser l'opération sur cette seule information.
+Le callback ne transporte qu'une intention/UI action.
+L'identité doit être récupérée depuis le contexte Telegram de l'utilisateur qui déclenche effectivement le callback.
+
+2.3 Username comme identifiant
+Les usernames ne sont pas des identifiants persistants adaptés à l'autorisation ou aux relations métier.
+La cible utilisera des identifiants stables, notamment :
+telegram_user_id
+database user id
+asset id
+signal id
+backtest id
+selon le contrat des modules concernés.
+
+2.4 Duplication de logique stratégique
+Le bot ne devra contenir aucune logique de :
+EMA
+SMA
+pivot
+crossover
+retest
+SL
+TP
+RR
+La Technical Specification impose une source unique de vérité dans strategy/.
+Le bot consommera les résultats produits par le moteur stratégique.
+
+2.5 Déduplication des signaux
+Le mandat BOT impose une déduplication persistante basée notamment sur :
+strategy_version
+symbol
+timeframe
+candle_timestamp
+direction
+signal_type
+Le mécanisme exact dépendra du contrat final database/signals.py.
+Risque actuel
+Sans identité persistante du signal :
+scan #1 → signal envoyé
+scan #2 → même signal envoyé
+scan #3 → même signal envoyé
+La cible sera :
+signal identity
+       ↓
+persistent lookup
+       ↓
+already delivered ?
+     /       \
+   yes        no
+   ↓           ↓
+ ignore       send
+               ↓
+          mark delivered
+
+2.6 État exact du bot EMA0.2
+À vérifier avant implémentation :
+	•	noms exacts des fichiers bot/ ;
+	•	classes existantes ;
+	•	fonctions existantes ;
+	•	système actuel de routing des commandes ;
+	•	système actuel de callbacks ;
+	•	méthode de notification ;
+	•	format actuel des callback payloads ;
+	•	tests existants ;
+	•	appels exacts à Supabase ;
+	•	couplage actuel avec services/.
+Je ne considère pas ces points comme établis tant que le code correspondant n'a pas été récupéré.
+
+3. Architecture cible
+3.1 Structure
+Architecture cible prévue :
+bot/
+├── commands/
+│   ├── start.py
+│   ├── allow.py
+│   ├── list.py
+│   ├── add_asset.py
+│   ├── remove_asset.py
+│   ├── set_tf.py
+│   ├── backtest.py
+│   ├── scan.py
+│   ├── logs.py
+│   ├── top_scan.py
+│   ├── restart.py
+│   ├── validate.py
+│   └── stats.py
+│
+├── callbacks/
+│   ├── authorization.py
+│   ├── assets.py
+│   ├── timeframe.py
+│   ├── scans.py
+│   └── backtests.py
+│
+├── notifications/
+│   ├── signals.py
+│   ├── rejected.py
+│   └── formatter.py
+│
+├── keyboards/
+│   ├── main.py
+│   ├── assets.py
+│   ├── timeframe.py
+│   └── backtests.py
+│
+└── services/
+    ├── authorization.py
+    ├── signal_delivery.py
+    └── bot_context.py
+Cette structure est une architecture cible, pas une affirmation que tous ces fichiers existent déjà.
+
+3.2 Responsabilités
+commands/
+Responsable de :
+	•	parsing des commandes ;
+	•	validation des entrées utilisateur ;
+	•	appel aux services ;
+	•	présentation des résultats.
+Pas de stratégie.
+
+callbacks/
+Responsable de :
+	•	traiter les interactions inline keyboard ;
+	•	extraire les identifiants ;
+	•	refaire l'autorisation ;
+	•	appeler le service approprié.
+Un callback ne doit jamais être une frontière d'autorisation.
+
+notifications/
+Responsable de :
+	•	transformation des objets métier en messages Telegram ;
+	•	formatage ;
+	•	déduplication de livraison ;
+	•	gestion des erreurs d'envoi.
+Pas de génération de signal.
+
+keyboards/
+Responsable exclusivement de l'UI Telegram :
+InlineKeyboardMarkup
+InlineKeyboardButton
+Les boutons doivent transporter des identifiants stables et minimaux.
+
+bot/services/authorization.py
+Responsable de :
+Telegram identity
+        ↓
+database user
+        ↓
+permissions
+Il constitue la frontière de sécurité du bot.
+
+bot/services/signal_delivery.py
+Responsable de :
+SignalSetup
+     ↓
+persistent identity
+     ↓
+already delivered?
+     ↓
+Telegram notification
+Il ne crée jamais le signal.
+
+4. Fichiers
+4.1 À créer
+Sous réserve de l'audit exact du dépôt EMA0.2 :
+Fichier	Justification
+bot/services/authorization.py	Centraliser l'autorisation runtime
+bot/services/signal_delivery.py	Déduplication et livraison des signaux
+bot/notifications/formatter.py	Formatage uniforme
+bot/notifications/signals.py	Notifications de signaux
+bot/notifications/rejected.py	Diagnostic des setups rejetés
+bot/commands/validate.py	Préparer /validate
+bot/commands/stats.py	Préparer /stats
+tests BOT dédiés	Couverture du nouveau comportement
+Les autres créations seront décidées après comparaison avec la structure réelle EMA0.2.
+
+4.2 À modifier
+Probablement :
+bot/
+config.py
+main.py
+requirements.txt
+mais uniquement si l'audit confirme que ces fichiers portent effectivement ces responsabilités.
+config.py
+Objectif :
+	•	supprimer les hypothèses d'autorisation fragiles ;
+	•	centraliser uniquement la configuration bot ;
+	•	ne pas y mettre de logique métier.
+
+main.py
+Objectif potentiel :
+	•	initialiser le bot ;
+	•	enregistrer les handlers ;
+	•	injecter les dépendances/services ;
+	•	ne pas devenir un nouveau service métier.
+
+fichiers bot/ existants
+Objectif :
+	•	conserver les commandes utiles ;
+	•	corriger les contrôles d'autorisation ;
+	•	remplacer les callbacks fragiles ;
+	•	déléguer aux services/modules appropriés.
+
+4.3 À supprimer éventuellement
+Aucune suppression n'est décidée à ce stade.
+Seront candidats à suppression uniquement :
+	•	duplications de handlers ;
+	•	ancien mécanisme d'autorisation devenu dangereux ;
+	•	code Telegram contenant de la stratégie ;
+	•	ancien code de déduplication incompatible avec le nouveau contrat ;
+	•	wrappers devenus inutiles après migration.
+Chaque suppression devra être explicitement justifiée.
+
+5. Interfaces
+Les interfaces ci-dessous sont proposées, et non encore des contrats validés.
+5.1 Authorization
+class AuthorizationService:
+    async def get_user(
+        self,
+        telegram_user_id: int,
+    ):
+        ...
+
+    async def require_permission(
+        self,
+        telegram_user_id: int,
+        permission: str,
+    ):
+        ...
+Le principe important est :
+telegram_user_id
+vient du contexte Telegram courant.
+
+5.2 Signal delivery
+class SignalDeliveryService:
+    async def deliver(
+        self,
+        signal,
+        chat_id: int,
+    ):
+        ...
+Avec une identité de signal conceptuelle :
+SignalIdentity(
+    strategy_version,
+    symbol,
+    timeframe,
+    candle_timestamp,
+    direction,
+    signal_type,
+)
+Le stockage de cette identité doit être aligné avec le DATABASE AGENT.
+
+5.3 Signal notification
+Entrée attendue :
+SignalSetup(
+    symbol,
+    timeframe,
+    timestamp,
+    direction,
+    entry,
+    stop_loss,
+    take_profit,
+    risk_distance,
+    reward_distance,
+    rr,
+    signal_type,
+    score,
+    metadata,
+)
+Ce contrat est défini conceptuellement par la Technical Specification.
+Telegram ne doit faire que présenter ce modèle.
+
+5.4 Format de notification
+Format cible :
+SYMBOL
+TIMEFRAME
+DIRECTION
+SIGNAL TYPE
+ENTRY
+SL
+TP
+RR
+STRATEGY VERSION
+TIMESTAMP
+Exemple conceptuel :
+BTCUSDT
+1H
+LONG
+RETEST
+ENTRY: ...
+SL: ...
+TP: ...
+RR: ...
+STRATEGY: ema_v0.3.0
+TIME: ...
+Aucune valeur ne sera recalculée par le bot.
+
+5.5 Rejected Setup
+Le bot pourra présenter :
+SetupRejected(
+    reason,
+    ...
+)
+notamment :
+RR_TOO_LOW
+NO_VALID_SL
+NO_VALID_TP
+NO_TREND_ALIGNMENT
+NO_RETEST
+ATR_FILTER_FAILED
+HTF_FILTER_FAILED
+VOLUME_FILTER_FAILED
+INSUFFICIENT_DATA
+La Technical Specification demande explicitement des rejets structurés plutôt que de simples chaînes de logs.
+
+6. Interfaces avec les autres agents
+MARKET
+Le BOT ne doit pas appeler directement les providers Binance/Bybit/Deriv pour générer des signaux.
+Flux :
+MARKET
+   ↓
+normalized market data
+   ↓
+STRATEGY
+   ↓
+SignalSetup
+   ↓
+BOT
+
+STRATEGY
+Interface principale :
+Strategy Engine
+      ↓
+SignalSetup / SetupRejected
+      ↓
+BOT
+Le BOT ne connaît pas l'algorithme interne.
+La stratégie reste la source unique de vérité.
+
+DATABASE
+Le BOT dépendra notamment des services de :
+users
+assets
+signals
+backtests
+Le DATABASE AGENT devra fournir les contrats exacts.
+
+BACKTEST
+Flux :
+BOT /backtest
+      ↓
+BACKTEST service
+      ↓
+Backtest result
+      ↓
+BOT formatter
+      ↓
+Telegram
+Le BOT ne calcule aucun résultat de backtest.
+
+QA
+Le QA AGENT est propriétaire de tests/.
+Le BOT fournira :
+	•	tests unitaires ciblés ;
+	•	scénarios d'intégration ;
+	•	cas de sécurité ;
+	•	cas de non-régression.
+Le découpage exact avec QA devra être coordonné avant implémentation.
+
+7. Dépendances
+7.1 À conserver
+La dépendance Telegram existante :
+python-telegram-bot>=20.0
+est déjà présente dans EMA0.2. (GitHub)
+Elle doit être conservée sauf décision architecturale contraire.
+Les autres dépendances EMA0.2 ne doivent pas être ajoutées au bot simplement parce qu'elles existent dans le projet.
+
+7.2 Supabase
+Supabase est actuellement utilisé dans EMA0.2. (GitHub)
+Le BOT ne doit toutefois pas décider lui-même de la nouvelle architecture database.
+Il doit consommer les interfaces du DATABASE AGENT.
+
+7.3 Nouvelles dépendances
+Aucune nouvelle dépendance n'est actuellement nécessairement requise.
+Principe :
+privilégier les dépendances existantes et les abstractions internes avant d'introduire une nouvelle librairie.
+Une nouvelle dépendance devra être proposée séparément avec :
+	•	problème résolu ;
+	•	alternatives ;
+	•	coût ;
+	•	impact sécurité ;
+	•	impact maintenance.
+
+8. Tests
+8.1 Tests unitaires
+Authorization
+Tester :
+authorized user
+unauthorized user
+unknown user
+revoked permission
+wrong permission
+et surtout :
+username différent
+username modifié
+callback falsifié
+callback provenant d'un autre utilisateur
+
+Callback
+Tester que :
+callback payload ≠ identité
+et que l'identité est toujours issue du contexte Telegram.
+
+Commands
+Chaque commande doit tester :
+	•	utilisateur autorisé ;
+	•	utilisateur non autorisé ;
+	•	arguments invalides ;
+	•	erreur du service ;
+	•	réponse correcte.
+
+Notification formatter
+Tester :
+	•	LONG ;
+	•	SHORT ;
+	•	CROSSOVER ;
+	•	RETEST ;
+	•	valeurs numériques ;
+	•	timestamp ;
+	•	strategy version ;
+	•	données manquantes ;
+	•	caractères spéciaux.
+
+Deduplication
+Tester :
+signal inédit → envoyé
+même signal → non envoyé
+même signal nouveau chat → comportement défini par contrat
+signal autre timeframe → envoyé
+signal autre timestamp → envoyé
+signal autre strategy_version → envoyé
+signal autre direction → envoyé
+signal autre signal_type → envoyé
+
+8.2 Tests d'intégration
+Scénario principal :
+Telegram Update
+       ↓
+Command Handler
+       ↓
+Authorization
+       ↓
+Database
+       ↓
+Strategy/Backtest Service
+       ↓
+BOT formatter
+       ↓
+Telegram response
+Scénarios critiques :
+	1.	utilisateur non autorisé tente /scan ;
+	2.	utilisateur autorisé lance /scan ;
+	3.	callback provenant d'un utilisateur non autorisé ;
+	4.	signal détecté deux fois ;
+	5.	backtest demandé ;
+	6.	résultat de backtest affiché ;
+	7.	/stats ;
+	8.	/validate.
+
+8.3 Tests de régression
+Toutes les fonctionnalités EMA0.2 conservées devront disposer de tests de non-régression :
+/start
+/allow
+/list
+/add_asset
+/remove_asset
+/set_tf
+/backtest
+/scan
+/logs
+/top_scan
+/restart
+Puis, lorsque disponibles :
+/validate
+/stats
+
+8.4 Fixtures
+Fixtures minimales proposées :
+authorized_user
+unauthorized_user
+admin_user
+asset
+timeframe
+signal_setup
+rejected_setup
+duplicate_signal
+backtest_result
+et éventuellement :
+telegram_update
+telegram_callback_query
+telegram_message
+Les fixtures database devront être compatibles avec les contrats du DATABASE AGENT.
+
+9. Risques
+9.1 Risques techniques
+Couplage EMA0.2
+Le bot EMA0.2 peut être fortement couplé à :
+database
+services
+strategy
+config
+Une migration directe pourrait casser les interfaces existantes.
+
+Contrats non finalisés
+Les interfaces strategy/, database/ et backtest/ sont encore en cours de conception.
+Il serait prématuré de figer des appels définitifs.
+
+9.2 Risques de sécurité
+Priorité maximale :
+authorization bypass
+callback spoofing
+stale permission
+username-based authorization
+Un handler privilégié ne doit jamais supposer qu'une action est autorisée parce qu'un bouton a été généré précédemment.
+
+9.3 Risques de régression
+Les commandes EMA0.2 fonctionnelles doivent continuer à fonctionner lorsque leur comportement reste dans le périmètre EMA0.3.
+La migration doit donc être progressive et testée.
+
+9.4 Risque de duplication stratégique
+Risque particulier :
+bot → recalcul EMA
+bot → recalcul RR
+bot → recalcul SL
+Cela est explicitement interdit.
+
+10. ARCHITECTURAL DECISION REQUIRED
+Les points suivants doivent être validés avant l'implémentation correspondante.
+ADR-BOT-001 — Identifiant d'autorisation
+Choisir officiellement :
+Telegram user ID
+comme identité externe primaire.
+Proposition : utiliser telegram_user_id, jamais le username comme identifiant de sécurité.
+Validation requise.
+
+ADR-BOT-002 — Modèle de permissions
+Définir les permissions exactes :
+admin
+allowed_user
+...
+et leur représentation dans database/users.py.
+Dépendance DATABASE AGENT.
+
+ADR-BOT-003 — Autorisation des callbacks
+Valider la règle :
+Toute action issue d'un callback refait intégralement le contrôle d'identité et de permission au moment du callback.
+Proposition : obligatoire.
+
+ADR-BOT-004 — Identité persistante du signal
+Valider le contrat exact :
+strategy_version
+symbol
+timeframe
+candle_timestamp
+direction
+signal_type
+et déterminer si cette combinaison est :
+	•	une clé naturelle ;
+	•	un hash ;
+	•	une clé persistante signal_id.
+Dépendance DATABASE + STRATEGY.
+
+ADR-BOT-005 — Scope de déduplication
+Définir si :
+signal déjà livré
+signifie :
+Option A
+déjà livré globalement à au moins un utilisateur ;
+ou
+Option B
+déjà livré à ce destinataire.
+Le mandat « le bot ne doit pas envoyer plusieurs fois le même signal » doit être précisé pour ce point.
+Validation requise.
+
+ADR-BOT-006 — /validate
+Définir précisément ce que /validate valide :
+	•	une expérience ;
+	•	un backtest ;
+	•	une version de stratégie ;
+	•	un résultat statistique ;
+	•	autre.
+Le BOT ne doit pas décider lui-même de la sémantique de validation.
+Dépendance VALIDATION AGENT.
+
+ADR-BOT-007 — /stats
+Définir la source et le contrat des statistiques :
+backtest.metrics
+validation.metrics
+database snapshots
+Dépendance BACKTEST + VALIDATION + DATABASE.
+
+ADR-BOT-008 — Diagnostic des rejets
+Valider si le mode diagnostic est :
+global
+par utilisateur
+par scan
+configuration admin
+Le bot doit seulement afficher le rejet fourni par la stratégie.
+
+ADR-BOT-009 — Concurrence des scans
+Définir le comportement si un utilisateur demande :
+/scan
+/scan
+/scan
+avant la fin du premier scan.
+Possibilités :
+reject
+queue
+deduplicate
+cancel previous
+Validation requise.
+
+ADR-BOT-010 — /restart
+Définir précisément les permissions et le périmètre de /restart.
+Cette commande est potentiellement privilégiée et doit impérativement utiliser l'autorisation runtime.
+
+ADR-BOT-011 — Architecture exacte du bot
+Valider si la structure :
+commands/
+callbacks/
+notifications/
+keyboards/
+services/
+est obligatoire ou si certaines responsabilités doivent rester dans la structure EMA0.2.
+
+11. Ordre d'implémentation
+L'ordre proposé est strict.
+Étape 0 — Validation du plan
+Aucune modification avant validation de ce plan.
+
+Étape 1 — Audit détaillé EMA0.2
+Inventaire :
+bot/
+database/
+services/
+config.py
+main.py
+requirements.txt
+Pour chaque handler :
+commande
+fichier
+fonction
+permission
+dépendances
+effets
+
+Étape 2 — Audit sécurité
+Cartographier :
+user identity
+authorization
+callbacks
+admin checks
+database checks
+Créer une matrice :
+Action	Public	User	Admin
+/start	✓	✓	✓
+/list	?	?	?
+/add_asset	?	?	?
+/scan	?	?	?
+/restart	?	?	?
+Les ? seront déterminés par les contrats validés, pas inventés.
+
+Étape 3 — Contrats inter-agents
+Attendre les interfaces définitives :
+DATABASE
+STRATEGY
+BACKTEST
+VALIDATION
+
+Étape 4 — Couche authorization
+Implémenter d'abord :
+identity
+→ database lookup
+→ permission check
+
+Étape 5 — Migration des commandes
+Migrer une commande à la fois :
+/start
+/allow
+/list
+/add_asset
+/remove_asset
+/set_tf
+/backtest
+/scan
+/logs
+/top_scan
+/restart
+
+Étape 6 — Callbacks
+Migrer les callbacks après sécurisation de l'autorisation.
+
+Étape 7 — Notifications
+Implémenter le formatter canonique puis les notifications.
+
+Étape 8 — Déduplication
+Brancher le mécanisme persistant avec le contrat DATABASE.
+
+Étape 9 — /validate et /stats
+Uniquement après définition des contrats correspondants.
+
+Étape 10 — Tests
+unit
+→ integration
+→ regression
+→ security
+
+Étape 11 — Audit final
+Vérifier :
+aucune logique stratégique
+aucun bypass authorization
+aucune duplication
+aucune notification duplicate
+aucune régression
+
+12. Critères d'acceptation
+Le BOT AGENT sera considéré comme terminé lorsque tous les critères suivants seront satisfaits.
+Fonctionnel
+Les commandes pertinentes fonctionnent :
+/start
+/allow
+/list
+/add_asset
+/remove_asset
+/set_tf
+/backtest
+/scan
+/logs
+/top_scan
+/restart
+et les nouvelles fonctionnalités :
+/validate
+/stats
+lorsque leurs contrats sont disponibles.
+
+Sécurité
+Aucune action privilégiée ne peut être effectuée sans :
+identity Telegram courante
++
+permission vérifiée au moment de l'action
+Un callback falsifié ou provenant d'un utilisateur non autorisé est rejeté.
+Un username seul ne peut jamais constituer une preuve d'autorisation.
+
+Architecture
+Le code bot/ ne contient aucune implémentation de :
+EMA
+SMA
+pivot
+crossover
+retest
+SL
+TP
+RR
+La stratégie est consommée via son interface.
+
+Notifications
+Chaque signal contient :
+SYMBOL
+TIMEFRAME
+DIRECTION
+SIGNAL TYPE
+ENTRY
+SL
+TP
+RR
+STRATEGY VERSION
+TIMESTAMP
+
+Déduplication
+Un même signal ne produit pas plusieurs livraisons dans le scope de déduplication validé.
+La clé d'identité respecte le contrat approuvé :
+strategy_version
+symbol
+timeframe
+candle_timestamp
+direction
+signal_type
+
+Tests
+Les tests unitaires, intégration, sécurité et régression passent.
+Aucun nouveau comportement important n'est livré sans test.
+
+Stratégie
+Aucune modification silencieuse de :
+EMA10
+SMA35
+EMA55
+pivots
+crossover
+retest
+SL
+TP
+RR
+La baseline ema_v0.3.0 reste inchangée par le BOT AGENT.
+
+13. Handoff
+Ce que le BOT AGENT fournira aux autres agents
+DATABASE AGENT
+Besoin de contrats pour :
+User
+Permission
+Asset
+Signal
+Signal delivery
+Backtest
+Particulièrement :
+find_user_by_telegram_id()
+check_permission()
+record_signal_delivery()
+has_signal_been_delivered()
+Les noms définitifs restent à décider ensemble.
+
+STRATEGY AGENT
+Besoin du contrat final :
+SignalSetup
+SetupRejected
+strategy_version
+Le BOT ne doit recevoir que des objets métier suffisamment riches pour présenter le signal sans recalcul.
+
+BACKTEST AGENT
+Besoin de :
+BacktestResult
+metrics
+report
+pour /backtest et /stats.
+
+VALIDATION AGENT
+Besoin du contrat exact de :
+validation experiment
+validation status
+validation metrics
+pour /validate.
+
+QA AGENT
+À fournir :
+command test matrix
+authorization test matrix
+callback security tests
+deduplication tests
+notification tests
+Le BOT AGENT devra coordonner les tests sans déplacer le ownership général de tests/.
+
+14. Points actuellement bloquants
+Avant de coder, je considère comme non résolus :
+	1.	le détail exact des handlers EMA0.2 ;
+	2.	les classes/fonctions actuelles de bot/ ;
+	3.	les contrats DATABASE définitifs ;
+	4.	le contrat définitif SignalSetup côté STRATEGY ;
+	5.	le contrat BACKTEST ;
+	6.	la sémantique de /validate ;
+	7.	la sémantique de /stats ;
+	8.	le scope exact de la déduplication ;
+	9.	la matrice exacte des permissions ;
+	10.	la politique de concurrence des /scan.
+Je ne transformerai aucun de ces points en décision implicite.
+
+15. Décision proposée
+Le plan recommande une migration contract-first :
+Validation des plans des agents
+             ↓
+Contrats inter-modules
+             ↓
+Audit précis EMA0.2
+             ↓
+Authorization
+             ↓
+Commands
+             ↓
+Callbacks
+             ↓
+Notifications
+             ↓
+Deduplication
+             ↓
+Tests
+             ↓
+Integration
+Cette approche respecte le principe du projet selon lequel les plans doivent être comparés afin d'identifier les conflits inter-modules avant le développement.
+
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW
+Aucune modification du code n'a été effectuée.
+J'attends maintenant la validation de ce plan, ainsi que les décisions listées dans ARCHITECTURAL DECISION REQUIRED, avant de commencer l'implémentation.}
+
+Qa agent:
+{J’ai vérifié les sources disponibles avant de figer le plan. Le PROJECT_STATE.md confirme que chaque agent doit produire son Implementation Plan v1.0 avant toute implémentation et que les plans doivent ensuite être comparés pour résoudre les dépendances inter-modules.
+Point important : je ne vais pas prétendre avoir inspecté du code EMA0.2 que je ne peux pas actuellement lire dans le repository accessible à cette conversation. Le PROJECT_STATE.md indique seulement que l’analyse du dépôt EMA0.2 a déjà été effectuée ; il ne fournit pas son arborescence détaillée ni ses signatures.
+Je marque donc explicitement les éléments qui nécessitent une inspection du repo avant implémentation, plutôt que de les transformer en hypothèses.
+EMA0.3 — QA AGENT
+Implementation Plan v1.0
+Statut : READY FOR REVIEW — aucune modification de code effectuée
+
+1. État actuel
+1.1 EMA0.2
+PROJECT_STATE.md indique qu'EMA0.2 constitue la baseline historique d'EMA0.3 et que son dépôt a déjà été analysé.
+Cependant, l'arborescence et le code source EMA0.2 ne sont pas actuellement disponibles dans les sources que je peux exploiter dans cette conversation.
+Je ne considère donc pas comme établi :
+	•	quels tests EMA0.2 existent ;
+	•	leur couverture ;
+	•	quelles fixtures existent ;
+	•	quelle CI existe ;
+	•	quelles fonctions/classes doivent être importées ;
+	•	quels tests historiques peuvent être directement migrés ;
+	•	quels bugs EMA0.2 sont déjà connus.
+Décision QA
+Avant toute création de test dépendant d'une API concrète :
+inspection obligatoire du repository source.
+Aucune signature ne sera inventée.
+
+1.2 EMA0.3
+L'état officiel est actuellement :
+Initialisation / Architecture en cours.
+EMA0.3 dispose de :
+	•	EMA0.3 Technical Specification v1.0 ;
+	•	AGENTS.md ;
+	•	PROJECT_STATE.md ;
+	•	architecture cible ;
+	•	séparation en sept agents.
+La responsabilité QA est explicitement limitée à :
+tests/
+CI
+qualité
+non-régression
+reproductibilité
+PROJECT_STATE.md attribue explicitement tests/ et CI au QA AGENT.
+
+1.3 Fonctionnalités à considérer comme baseline
+La baseline ema_v0.3.0 conserve :
+	•	EMA10 ;
+	•	SMA35 ;
+	•	EMA55 ;
+	•	pivots gauche/droite = 10 ;
+	•	minimum RR = 2.7 ;
+	•	crossover long/short ;
+	•	retest long/short ;
+	•	SL/TP structurels ;
+	•	candles confirmées ;
+	•	absence de lookahead.
+Ces éléments seront traités comme contrats de régression, et non comme des fonctionnalités que QA est autorisé à modifier.
+ATR, multi-timeframe, volume et scoring sont explicitement considérés comme des extensions expérimentales, et non comme faisant partie de la baseline validée.
+
+1.4 Ce qui doit impérativement être conservé
+QA protégera particulièrement :
+	1.	les résultats historiques de référence ;
+	2.	la définition ema_v0.3.0 ;
+	3.	l'absence de lookahead ;
+	4.	le comportement des candles confirmées ;
+	5.	les règles crossover/retest ;
+	6.	les calculs SL/TP ;
+	7.	le seuil RR ;
+	8.	la reproductibilité des backtests ;
+	9.	l'unicité de la source stratégique.
+Le principe architectural est explicite : le backtester et le bot ne doivent pas réimplémenter leur propre stratégie.
+
+2. Problèmes identifiés
+2.1 Bugs connus
+Aucun bug concret ne peut actuellement être déclaré comme confirmé.
+La raison est importante : aucun code source EMA0.2/EMA0.3 exploitable n'est disponible dans le contexte actuel.
+Je distinguerai donc :
+BUG CONFIRMED
+BUG SUSPECTED
+UNDEFINED BEHAVIOR
+ARCHITECTURAL RISK
+afin de ne pas transformer une absence de connaissance en bug fictif.
+
+2.2 Limitations actuelles
+L1 — Absence de suite QA EMA0.3 finalisée
+Le projet est encore en phase de planification.
+L2 — Golden baseline non encore figée
+Les datasets déterministes doivent être construits à partir de la stratégie réellement implémentée et des décisions validées.
+L3 — Interfaces inter-agents non encore figées
+Les contrats entre :
+MARKET → STRATEGY
+STRATEGY → BACKTEST
+STRATEGY → DATABASE
+BACKTEST → DATABASE/VALIDATION
+doivent être stabilisés avant que les tests d'intégration soient définitifs.
+L4 — Code EMA0.2 à inspecter
+La stratégie de migration des tests dépendra de ce qui existe réellement dans EMA0.2.
+
+3. Architecture cible QA
+Le QA AGENT ne créera pas de nouvelle logique métier.
+Architecture cible :
+EMA0.3/
+│
+├── market/
+├── strategy/
+├── backtest/
+├── database/
+├── bot/
+│
+├── tests/
+│   ├── unit/
+│   ├── strategy/
+│   ├── backtest/
+│   ├── integration/
+│   └── fixtures/
+│
+├── docs/
+│   └── QA/
+│
+└── .github/
+    └── workflows/
+        └── ci.yml
+Le flux de validation sera :
+Market fixtures
+      ↓
+Market tests
+      ↓
+Strategy tests
+      ↓
+Golden strategy regression
+      ↓
+Backtest tests
+      ↓
+Integration tests
+      ↓
+Database persistence tests
+      ↓
+CI
+
+4. Fichiers
+Les noms exacts seront ajustés après inspection du repo et des plans des autres agents.
+4.1 À créer
+Tests unitaires
+tests/unit/
+Pour les fonctions déterministes et isolées.
+Exemples potentiels :
+test_indicators.py
+test_timestamps.py
+test_normalization.py
+test_metrics.py
+Justification : tester les briques sans dépendance externe.
+
+Strategy regression
+tests/strategy/
+Exemples :
+test_crossover.py
+test_retest.py
+test_pivots.py
+test_risk_reward.py
+test_setup_validation.py
+test_no_lookahead.py
+Justification : protéger la baseline stratégique.
+
+Backtest
+tests/backtest/
+Exemples :
+test_entry.py
+test_exit.py
+test_ambiguous_candle.py
+test_slippage.py
+test_fees.py
+test_expiration.py
+test_position_sizing.py
+test_drawdown.py
+test_equity_curve.py
+
+Integration
+tests/integration/
+Pour tester les contrats réels entre modules.
+
+Fixtures
+tests/fixtures/
+Avec séparation :
+tests/fixtures/
+├── market/
+├── strategy/
+├── backtest/
+└── database/
+
+CI
+.github/workflows/ci.yml
+Justification : automatiser le contrat QA à chaque push/PR.
+
+Documentation
+Potentiellement :
+docs/QA.md
+ou une structure docs/qa/, selon l'organisation retenue par le projet.
+
+4.2 À modifier
+Potentiellement :
+pyproject.toml
+pytest.ini
+requirements.txt
+.github/workflows/ci.yml
+mais uniquement si ces fichiers existent déjà ou si leur création est cohérente avec l'architecture finale.
+Modification possible pour :
+	•	pytest ;
+	•	markers ;
+	•	coverage ;
+	•	lint ;
+	•	type checking ;
+	•	configuration CI.
+
+4.3 À supprimer
+Aucune suppression prévue dans le plan v1.0.
+Une suppression ne sera proposée que si l'inspection du repo montre :
+	•	test obsolète ;
+	•	duplication ;
+	•	fixture contradictoire ;
+	•	ancienne CI devenue dangereuse ;
+	•	migration EMA0.2 explicitement décidée.
+
+5. Interfaces
+QA ne définit pas arbitrairement les interfaces métier.
+Il testera les interfaces fournies par les agents propriétaires.
+5.1 MARKET → STRATEGY
+Contrat attendu à vérifier :
+Market data
+    ↓
+normalised OHLCV
+    ↓
+Strategy
+QA devra notamment vérifier :
+	•	timestamps ;
+	•	ordre chronologique ;
+	•	absence de doublons ;
+	•	candles manquantes ;
+	•	données invalides ;
+	•	timeframe ;
+	•	pagination.
+Le type/modèle exact reste à confirmer avec MARKET AGENT.
+
+5.2 STRATEGY → BACKTEST
+Contrat central :
+Strategy
+   ↓
+SignalSetup
+   ↓
+Backtest
+Le SignalSetup est explicitement au centre de l'architecture cible.
+QA vérifiera notamment :
+direction
+entry
+SL
+TP
+RR
+timestamp
+symbol
+timeframe
+strategy_version
+Les noms et types exacts doivent être fournis par STRATEGY AGENT.
+
+5.3 STRATEGY → DATABASE
+QA testera la persistence des résultats stratégiques.
+Points à vérifier :
+	•	identifiants ;
+	•	unicité ;
+	•	version de stratégie ;
+	•	timestamps ;
+	•	déduplication ;
+	•	récupération.
+
+5.4 BACKTEST → résultats
+QA testera le contrat de résultat du backtest :
+trades
+equity
+PnL
+fees
+slippage
+drawdown
+duration
+exit_reason
+Les champs exacts doivent être confirmés par BACKTEST AGENT.
+
+6. Dépendances
+6.1 Dépendances existantes
+À conserver tant qu'elles sont déjà utilisées correctement par le projet.
+Inspection du repo requise avant décision définitive.
+QA ne remplacera pas une dépendance simplement pour des raisons de préférence.
+
+6.2 Nouvelles dépendances éventuelles
+pytest
+Dépendance de test principale.
+pytest-cov
+Pour mesurer la couverture.
+Ruff / équivalent
+Pour lint/format si cela correspond au choix global du projet.
+mypy / équivalent
+Pour type checking si le projet utilise des annotations suffisamment structurées.
+Aucune de ces dépendances n'est considérée comme définitivement validée dans ce plan.
+La décision doit rester compatible avec l'écosystème retenu par le projet.
+
+7. Tests
+7.1 Unit tests
+Couvrir :
+	•	indicateurs ;
+	•	calculs numériques ;
+	•	normalisation ;
+	•	timestamps ;
+	•	métriques ;
+	•	transformations déterministes.
+Objectif :
+une fonction
+→ une entrée déterministe
+→ un résultat attendu
+
+7.2 Strategy tests
+Crossover
+LONG :
+previous_fast <= previous_slow
+current_fast > current_slow
+SHORT :
+previous_fast >= previous_slow
+current_fast < current_slow
+Tests de frontière inclus.
+
+Retest
+Tester les conditions exactes définies par la stratégie.
+La définition mathématique exacte du retest doit être fournie par STRATEGY AGENT avant fixture finale.
+
+Pivot
+Tester :
+	•	confirmation ;
+	•	fenêtre gauche/droite = 10 ;
+	•	disponibilité temporelle ;
+	•	sélection ;
+	•	cas limites.
+
+SL/TP
+Tester :
+	•	niveau valide ;
+	•	niveau absent ;
+	•	niveau structurel incorrect ;
+	•	direction LONG ;
+	•	direction SHORT.
+
+RR
+Tester :
+RR = reward / risk
+et les frontières :
+RR < 2.7
+RR = 2.7
+RR > 2.7
+
+7.3 Lookahead tests
+Test fondamental :
+data jusqu'à T
+        ↓
+signal(T)
+puis :
+data jusqu'à T + N
+        ↓
+signal(T)
+Le signal déjà confirmé à T ne doit pas être modifié par des informations futures.
+Les pivots nécessitant des candles de confirmation feront l'objet de tests spécifiques afin de distinguer :
+pivot occurrence
+pivot confirmation
+signal availability
+
+7.4 Backtest regression
+Cas obligatoires :
+Cas	Attendu
+entrée	trade créé correctement
+TP	sortie TP
+SL	sortie SL
+TP + SL même candle	politique explicitement appliquée
+slippage	prix ajusté correctement
+fees	coût intégré
+expiration	trade fermé selon contrat
+sizing	taille déterministe
+drawdown	calcul reproductible
+equity	courbe reproductible
+7.5 Database tests
+Tester :
+insert
+→ persist
+→ retrieve
+→ duplicate
+→ reject/deduplicate
+ainsi que les migrations.
+
+7.6 Golden datasets
+Le principe sera :
+fixture immutable
+       ↓
+implementation
+       ↓
+expected result
+Les expected results seront versionnés.
+Un changement de résultat déclenchera :
+REGRESSION
+jusqu'à démonstration qu'il s'agit d'un changement intentionnel.
+
+7.7 CI
+Pipeline cible :
+Install
+   ↓
+Lint
+   ↓
+Type check
+   ↓
+Unit tests
+   ↓
+Strategy regression
+   ↓
+Backtest regression
+   ↓
+Integration
+   ↓
+Coverage
+Les étapes pourront être parallélisées après stabilisation.
+
+8. Risques
+R1 — Régression stratégique
+Probabilité : élevée pendant migration.
+Une modification de la stratégie pourrait changer les résultats historiques.
+Mitigation : golden datasets.
+
+R2 — Lookahead
+Impact : critique.
+Une stratégie pouvant accéder indirectement à des informations futures rendrait les résultats de recherche invalides.
+Mitigation : tests temporels dédiés.
+
+R3 — Divergence entre STRATEGY et BACKTEST
+Le backtester pourrait involontairement recréer une partie de la stratégie.
+Mitigation :
+Strategy → SignalSetup → Backtest
+et tests d'intégration.
+Ce principe est explicitement imposé par l'architecture EMA0.3.
+
+R4 — Ambiguïté SL + TP
+Une même candle peut toucher les deux.
+Sans politique explicite, deux implémentations peuvent produire des résultats différents.
+Décision requise.
+
+R5 — Retest ambigu
+Une définition imprécise produit des golden tests artificiels.
+Décision STRATEGY requise.
+
+R6 — Migration EMA0.2
+La migration peut conserver involontairement un comportement historique qui n'est plus conforme à la spécification.
+QA devra distinguer :
+historical behavior
+vs
+EMA0.3 specified behavior
+
+R7 — Dépendances inter-agents
+QA dépend principalement de :
+MARKET
+STRATEGY
+BACKTEST
+DATABASE
+mais ne doit pas devenir propriétaire de leurs implémentations.
+
+9. ARCHITECTURAL DECISION REQUIRED
+Les décisions suivantes doivent être validées avant les tests définitifs et avant implémentation QA correspondante.
+ADR-QA-001 — Politique candle ambiguë
+Si une candle touche simultanément SL et TP :
+Quelle politique fait foi pour les résultats officiels ?
+Options possibles à confirmer avec BACKTEST :
+WORST_CASE
+STOP_FIRST
+TARGET_FIRST
+OPEN_PROXIMITY
+QA ne choisit pas silencieusement.
+
+ADR-QA-002 — Prix d'expiration
+À l'expiration du nombre maximal de bars :
+close ?
+open ?
+autre prix ?
+
+ADR-QA-003 — Définition exacte du retest
+Il faut définir mathématiquement ce qui constitue une interaction avec EMA10.
+Par exemple, le contrat pourrait utiliser :
+low <= EMA10 <= high
+mais ceci est une hypothèse et non une décision validée.
+
+ADR-QA-004 — Pivot
+Il faut préciser :
+	•	définition exacte du pivot ;
+	•	tie handling ;
+	•	pivot retenu pour SL ;
+	•	pivot retenu pour TP ;
+	•	timestamp de disponibilité.
+
+ADR-QA-005 — Initialisation indicateurs
+Que doit faire le moteur lorsqu'il n'existe pas assez de candles pour :
+	•	EMA55 ;
+	•	ATR éventuel ;
+	•	pivot ;
+	•	autres indicateurs ?
+
+ADR-QA-006 — Timestamps
+Valider :
+	•	timezone canonique ;
+	•	précision ;
+	•	inclusivité start/end ;
+	•	représentation persistée.
+
+ADR-QA-007 — Golden baseline
+Décider quel dataset constitue officiellement :
+ema_v0.3.0
+et comment une évolution de stratégie crée une nouvelle baseline/version.
+
+ADR-QA-008 — Coverage gate
+Déterminer si CI impose :
+global coverage threshold
+et/ou des seuils par package.
+
+ADR-QA-009 — Outils qualité
+Valider le stack :
+pytest
+pytest-cov
+ruff
+mypy
+ou celui choisi par le projet.
+
+ADR-QA-010 — Compatibilité EMA0.2
+Déterminer quels tests EMA0.2 doivent être :
+migrated
+adapted
+deprecated
+preserved as historical regression tests
+Cette décision nécessite l'inspection du repo.
+
+10. Ordre d'implémentation
+L'ordre proposé est strictement celui-ci.
+Étape 0 — Repository audit
+Inspecter :
+EMA0.2
+EMA0.3
+tests existants
+configuration Python
+CI existante
+dépendances
+Aucune modification.
+
+Étape 1 — Contract alignment
+Recevoir les interfaces finales de :
+MARKET
+STRATEGY
+BACKTEST
+DATABASE
+
+Étape 2 — Décisions architecturales
+Résoudre les ADR-QA listés ci-dessus.
+
+Étape 3 — Fixtures fondamentales
+Créer les fixtures déterministes :
+market
+strategy
+backtest
+database
+
+Étape 4 — Unit tests
+Implémenter les tests isolés.
+
+Étape 5 — Strategy regression
+Implémenter :
+crossover
+retest
+pivot
+SL/TP
+RR
+invalid setups
+lookahead
+
+Étape 6 — Backtest regression
+Implémenter tous les cas déterministes.
+
+Étape 7 — Integration tests
+Tester les contrats :
+market → strategy
+strategy → backtest
+strategy → database
+backtest → persistence
+
+Étape 8 — CI
+Ajouter progressivement :
+pytest
+lint
+type checking
+coverage
+integration
+
+Étape 9 — Documentation QA
+Documenter :
+	•	comment exécuter les tests ;
+	•	comment régénérer/valider les fixtures ;
+	•	politique de golden regression ;
+	•	procédure de traitement d'une régression.
+
+Étape 10 — Baseline QA sign-off
+Vérifier :
+all tests pass
+golden baseline stable
+no unexplained regression
+CI green
+documentation complete
+
+11. Critères d'acceptation
+Le travail QA sera considéré terminé lorsque :
+Tests
+	•	 unit tests couvrent les composants déterministes ;
+	•	 strategy regression est automatisée ;
+	•	 backtest regression est automatisée ;
+	•	 integration tests couvrent les interfaces critiques ;
+	•	 database tests couvrent persistence + unicité + migrations ;
+	•	 lookahead tests passent.
+Golden datasets
+	•	 fixtures déterministes ;
+	•	 expected outputs versionnés ;
+	•	 résultats reproductibles ;
+	•	 toute divergence détectée automatiquement.
+CI
+	•	 pytest exécuté automatiquement ;
+	•	 lint exécuté ;
+	•	 type checking exécuté si retenu ;
+	•	 coverage mesurée ;
+	•	 integration tests exécutés dans le pipeline approprié.
+Qualité
+	•	 aucune stratégie réimplémentée dans les tests ;
+	•	 aucun comportement stratégique modifié par QA ;
+	•	 aucune hypothèse non validée présentée comme contrat ;
+	•	 chaque régression possède une cause documentée ;
+	•	 documentation QA disponible.
+Reproductibilité
+Deux exécutions identiques avec les mêmes données, paramètres et version de stratégie doivent produire les mêmes résultats.
+
+12. Handoff
+Pour commencer l'implémentation, QA demande aux autres agents les éléments suivants.
+MARKET AGENT
+Fournir :
+	•	modèles OHLCV définitifs ;
+	•	normalisation ;
+	•	contrat timestamps ;
+	•	pagination ;
+	•	gestion erreurs/retries ;
+	•	comportement candles manquantes.
+
+STRATEGY AGENT
+Fournir :
+	•	SignalSetup définitif ;
+	•	interfaces publiques ;
+	•	définition exacte crossover ;
+	•	définition exacte retest ;
+	•	définition pivot ;
+	•	calcul SL/TP ;
+	•	calcul RR ;
+	•	règles d'invalidation ;
+	•	timestamp exact du signal ;
+	•	règles anti-lookahead.
+
+BACKTEST AGENT
+Fournir :
+	•	interface moteur ;
+	•	modèle Trade ;
+	•	modèle résultat ;
+	•	politique SL/TP ;
+	•	politique candle ambiguë ;
+	•	slippage ;
+	•	fees ;
+	•	expiration ;
+	•	position sizing ;
+	•	equity ;
+	•	drawdown.
+
+DATABASE AGENT
+Fournir :
+	•	modèles persistés ;
+	•	contraintes d'unicité ;
+	•	mécanisme de migration ;
+	•	comportement déduplication ;
+	•	interfaces repository.
+
+VALIDATION AGENT
+Fournir, lorsque pertinent :
+	•	datasets statistiques de validation ;
+	•	hypothèses de validation ;
+	•	critères de reproductibilité ;
+	•	résultats historiques servant de référence.
+
+BOT AGENT
+Aucun travail QA métier direct demandé au BOT AGENT à ce stade.
+QA vérifiera ultérieurement les contrats d'intégration si le bot consomme des objets produits par STRATEGY/DATABASE.
+
+13. Limites de responsabilité QA
+Le QA AGENT ne prendra pas en charge :
+market/
+strategy/
+backtest/
+database/
+bot/
+Il ne modifiera pas leur logique métier pour faire passer les tests.
+Son rôle sera :
+tester
+↓
+détecter
+↓
+reproduire
+↓
+documenter
+↓
+attribuer
+En cas d'échec :
+test fail
+   ↓
+cause
+   ↓
+bug ?
+   ├── oui → correction par agent propriétaire
+   │
+   ├── changement intentionnel → validation/documentation
+   │
+   └── ambiguïté → ARCHITECTURAL DECISION REQUIRED
+Cela respecte la règle du projet selon laquelle une modification importante doit être justifiée et que les changements affectant la reproductibilité doivent être signalés.
+
+14. Résumé opérationnel
+                 EMA0.3
+                    │
+          Technical Specification
+                    │
+              Strategy baseline
+                    │
+             ┌──────┴──────┐
+             │             │
+         Runtime       Backtest
+             │             │
+             └──────┬──────┘
+                    │
+                 QA TESTS
+                    │
+       ┌────────────┼────────────┐
+       │            │            │
+     Unit       Regression   Integration
+       │            │            │
+       └────────────┼────────────┘
+                    │
+                Golden data
+                    │
+                   CI
+Le principe central reste celui du PROJECT_STATE.md : une seule source de vérité pour la stratégie, avec SignalSetupcomme interface entre stratégie et backtest.
+
+IMPLEMENTATION PLAN v1.0 — READY FOR REVIEW
+Aucune modification de code n'a été effectuée.
+Je m'arrête ici et attends la validation de ce plan avant toute implémentation.
+}
